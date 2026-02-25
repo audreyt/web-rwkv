@@ -23,6 +23,7 @@ pub enum ModelVersion {
     V5,
     V6,
     V7,
+    Brumby,
 }
 
 #[wasm_bindgen]
@@ -69,6 +70,7 @@ pub enum ModelCustomInfo {
     None,
     V6(super::v6::CustomInfo),
     V7(super::v7::CustomInfo),
+    Brumby(super::brumby::CustomInfo),
 }
 
 pub trait AsAny {
