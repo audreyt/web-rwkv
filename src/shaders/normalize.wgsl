@@ -115,6 +115,7 @@ fn rms_norm(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     }
 }
 
+#ifdef GROUP_SIZE
 /// Group RMS norm: normalize groups of GROUP_SIZE elements independently.
 /// Used for per-head Q/K norms in Brumby (where w has shape [head_dim]).
 /// Dispatch: [num_groups, num_token, num_batch].
@@ -158,6 +159,7 @@ fn group_rms_norm(
         store_x(bb + i, fma(value, unpack4x16float(w[i]), unpack4x16float(b[i])));
     }
 }
+#endif
 
 @compute @workgroup_size(BLOCK_SIZE, 1, 1)
 fn l2_norm(@builtin(global_invocation_id) invocation_id: vec3<u32>) {

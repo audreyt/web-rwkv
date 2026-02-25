@@ -13,6 +13,7 @@ struct Cursor {
 struct Input {
     @builtin(global_invocation_id) uid: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
 };
 
 // shape from Q tensor meta: [NUM_HEADS * head_dim, num_token, 1, 1]
@@ -126,13 +127,9 @@ fn power_retention(in: Input) {
     let kv_stride = NUM_KV_HEADS * HEAD_SIZE;
     let num_token = shape.y;
 
-    let head = in.uid.x / BLOCK_SIZE;
+    let head = in.wid.x;
     let idx = in.tid.x;
     let kv_head = head * NUM_KV_HEADS / NUM_HEADS;
-
-    if head >= NUM_HEADS {
-        return;
-    }
 
     for (var t = 0u; t < num_token; t++) {
         let cursor = compute_cursor(cursors[t]);

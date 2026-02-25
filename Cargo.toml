@@ -27,6 +27,9 @@ version.workspace = true
 [workspace.dependencies]
 serde = "1.0"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 ahash = "0.8"
 bytemuck = { version = "1.24", features = ["extern_crate_alloc"] }
@@ -55,6 +58,9 @@ tracing-tracy = { version = "0.11", optional = true }
 trait-variant = "0.1"
 uid = "0.1"
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+getrandom = { version = "0.3", features = ["wasm_js"], optional = true }
 wgpu = "28.0"
 
 [dependencies.web-rwkv-derive]
@@ -84,7 +90,7 @@ default = ["native"]
 
 classic = ["tokio"]
 native = ["subgroup-ops", "tokio"]
-web = []
+web = ["wasm-bindgen-futures", "js-sys", "getrandom"]
 
 ## Enables subgroup operations in the kernels. Accelerates the inference on some device.
 subgroup-ops = []

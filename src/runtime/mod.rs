@@ -222,6 +222,12 @@ where
 pub struct SimpleRuntime<M, I, J>(M, PhantomData<(I, J)>);
 
 impl<M, I, J> SimpleRuntime<M, I, J> {
+    /// Access the inner bundle (model + state dispatcher).
+    #[inline]
+    pub fn bundle(&self) -> &M {
+        &self.0
+    }
+
     #[inline]
     pub fn new<T, F>(bundle: M) -> Self
     where
