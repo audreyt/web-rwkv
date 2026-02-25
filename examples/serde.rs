@@ -21,13 +21,13 @@ use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
     runtime::{
         infer::{Rnn, RnnInput, RnnInputBatch, RnnOption},
-        loader::{Loader, Lora},
+        loader::{Loader, Lora, ShardedSafeTensors},
         model::{ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant},
         softmax::softmax_one,
-        v4, v5, v6, v7, Runtime, TokioRuntime,
+        brumby, v4, v5, v6, v7, Runtime, TokioRuntime,
     },
     tensor::serialization::Seed,
-    tokenizer::Tokenizer,
+    tokenizer::{BpeTokenizer, Tokenizer},
     wgpu,
 };
 
@@ -73,12 +73,50 @@ async fn create_context(info: &ModelInfo, _auto: bool) -> Result<Context> {
     Ok(context)
 }
 
-async fn load_tokenizer() -> Result<Tokenizer> {
-    let file = File::open("assets/vocab/rwkv_vocab_v20230424.json").await?;
-    let mut reader = BufReader::new(file);
-    let mut contents = String::new();
-    reader.read_to_string(&mut contents).await?;
-    Ok(Tokenizer::new(&contents)?)
+enum AnyTokenizer {
+    Rwkv(Tokenizer),
+    Bpe(BpeTokenizer),
+}
+
+impl AnyTokenizer {
+    fn encode(&self, input: &[u8]) -> anyhow::Result<Vec<u32>> {
+        Ok(match self {
+            Self::Rwkv(t) => t.encode(input)?,
+            Self::Bpe(t) => t.encode(input)?,
+        })
+    }
+
+    fn decode(&self, tokens: &[u32]) -> anyhow::Result<Vec<u8>> {
+        Ok(match self {
+            Self::Rwkv(t) => t.decode(tokens)?,
+            Self::Bpe(t) => t.decode(tokens)?,
+        })
+    }
+}
+
+async fn load_tokenizer(model_path: &std::path::Path, version: ModelVersion) -> Result<AnyTokenizer> {
+    match version {
+        ModelVersion::Brumby => {
+            let dir = if model_path.is_dir() {
+                model_path.to_path_buf()
+            } else {
+                model_path.parent().unwrap().to_path_buf()
+            };
+            let tok_path = dir.join("tokenizer.json");
+            let file = File::open(&tok_path).await?;
+            let mut reader = BufReader::new(file);
+            let mut contents = String::new();
+            reader.read_to_string(&mut contents).await?;
+            Ok(AnyTokenizer::Bpe(BpeTokenizer::new(&contents)?))
+        }
+        _ => {
+            let file = File::open("assets/vocab/rwkv_vocab_v20230424.json").await?;
+            let mut reader = BufReader::new(file);
+            let mut contents = String::new();
+            reader.read_to_string(&mut contents).await?;
+            Ok(AnyTokenizer::Rwkv(Tokenizer::new(&contents)?))
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -119,79 +157,192 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let tokenizer = load_tokenizer().await?;
-
-    let file = File::open(cli.model).await?;
-    let data = unsafe { Mmap::map(&file)? };
-
-    let model = SafeTensors::deserialize(&data)?;
-    let info = Loader::info(&model)?;
-    log::info!("{:#?}", info);
-
-    let context = create_context(&info, cli.adapter).await?;
-    log::info!("{:#?}", context.adapter.get_info());
-
-    let quant = (0..cli.quant)
-        .map(|layer| (layer, Quant::Int8))
-        .chain((0..cli.quant_nf4).map(|layer| (layer, Quant::NF4)))
-        .chain((0..cli.quant_sf4).map(|layer| (layer, Quant::SF4)))
-        .collect();
-    let lora = match cli.lora {
-        Some(path) => {
-            let file = File::open(path).await?;
-            let mut reader = BufReader::new(file);
-            let mut data = vec![];
-            reader.read_to_end(&mut data).await?;
-            Some(data)
-        }
-        None => None,
+    // Detect sharded vs single-file model.
+    // Sharded models are detected by:
+    // 1. --model points to a directory containing model.safetensors.index.json
+    // 2. --model points to a .safetensors.index.json file
+    let (is_sharded, index_json_path) = if cli.model.is_dir() {
+        let p = cli.model.join("model.safetensors.index.json");
+        (p.exists(), p)
+    } else if cli.model.extension().is_some_and(|e| e == "json") {
+        (cli.model.exists(), cli.model.clone())
+    } else {
+        let p = cli
+            .model
+            .parent()
+            .unwrap()
+            .join("model.safetensors.index.json");
+        (p.exists(), p)
     };
 
-    let builder = ModelBuilder::new(&context, model).quant(quant);
-    let builder = match &lora {
-        Some(data) => {
-            let data = SafeTensors::deserialize(data)?;
-            let blend = Default::default();
-            let lora = Lora { data, blend };
-            builder.lora(lora)
-        }
-        None => builder,
+    // Memory-map model data. For sharded models, map each shard file.
+    let shard_mmaps: Vec<(String, Mmap)>;
+    let single_mmap: Mmap;
+    let index_json: String;
+
+    let (context, info, runtime): (Context, ModelInfo, Box<dyn Runtime<Rnn>>) = if is_sharded {
+        let base_dir = index_json_path.parent().unwrap().to_path_buf();
+
+        let mut idx_file = File::open(&index_json_path).await?;
+        let mut idx_contents = String::new();
+        idx_file.read_to_string(&mut idx_contents).await?;
+        index_json = idx_contents;
+
+        // Parse index to find unique shard filenames.
+        let parsed: serde_json::Value = serde_json::from_str(&index_json)?;
+        let weight_map = parsed["weight_map"].as_object().unwrap();
+        let mut shard_filenames: Vec<String> = weight_map
+            .values()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        shard_filenames.sort();
+        shard_filenames.dedup();
+
+        // Memory-map all shard files.
+        shard_mmaps = {
+            let mut mmaps = Vec::new();
+            for filename in &shard_filenames {
+                let path = base_dir.join(filename);
+                let file = File::open(&path).await?;
+                let mmap = unsafe { Mmap::map(&file)? };
+                mmaps.push((filename.clone(), mmap));
+            }
+            mmaps
+        };
+
+        let shard_refs: Vec<(&str, &[u8])> = shard_mmaps
+            .iter()
+            .map(|(name, mmap)| (name.as_str(), mmap.as_ref()))
+            .collect();
+        let model = ShardedSafeTensors::new(&index_json, &shard_refs)?;
+        let info = Loader::info(&model)?;
+        log::info!("{:#?}", info);
+
+        let context = create_context(&info, cli.adapter).await?;
+        log::info!("{:#?}", context.adapter.get_info());
+
+        let quant = (0..cli.quant)
+            .map(|layer| (layer, Quant::Int8))
+            .chain((0..cli.quant_nf4).map(|layer| (layer, Quant::NF4)))
+            .chain((0..cli.quant_sf4).map(|layer| (layer, Quant::SF4)))
+            .collect();
+
+        let builder = ModelBuilder::new(&context, model).quant(quant);
+
+        let runtime: Box<dyn Runtime<Rnn>> = match info.version {
+            ModelVersion::V4 => {
+                let model = builder.build_v4().await?;
+                Box::new(TokioRuntime::new(v4::Bundle::<f16>::new(model, 1)).await)
+            }
+            ModelVersion::V5 => {
+                let model = builder.build_v5().await?;
+                Box::new(TokioRuntime::new(v5::Bundle::<f16>::new(model, 1)).await)
+            }
+            ModelVersion::V6 => {
+                let model = builder.build_v6().await?;
+                Box::new(TokioRuntime::new(v6::Bundle::<f16>::new(model, 1)).await)
+            }
+            ModelVersion::V7 => {
+                let model = builder.build_v7().await?;
+                Box::new(TokioRuntime::new(v7::Bundle::<f16>::new(model, 1)).await)
+            }
+            ModelVersion::Brumby => {
+                let model = builder.build_brumby().await?;
+                Box::new(TokioRuntime::new(brumby::Bundle::<f16>::new(model, 1)).await)
+            }
+        };
+
+        (context, info, runtime)
+    } else {
+        let model_path = if cli.model.is_dir() {
+            cli.model.join("model.safetensors")
+        } else {
+            cli.model.clone()
+        };
+        let file = File::open(&model_path).await?;
+        single_mmap = unsafe { Mmap::map(&file)? };
+
+        let model = SafeTensors::deserialize(&single_mmap)?;
+        let info = Loader::info(&model)?;
+        log::info!("{:#?}", info);
+
+        let context = create_context(&info, cli.adapter).await?;
+        log::info!("{:#?}", context.adapter.get_info());
+
+        let quant = (0..cli.quant)
+            .map(|layer| (layer, Quant::Int8))
+            .chain((0..cli.quant_nf4).map(|layer| (layer, Quant::NF4)))
+            .chain((0..cli.quant_sf4).map(|layer| (layer, Quant::SF4)))
+            .collect();
+        let lora = match cli.lora {
+            Some(path) => {
+                let file = File::open(path).await?;
+                let mut reader = BufReader::new(file);
+                let mut data = vec![];
+                reader.read_to_end(&mut data).await?;
+                Some(data)
+            }
+            None => None,
+        };
+
+        let builder = ModelBuilder::new(&context, model).quant(quant);
+        let builder = match &lora {
+            Some(data) => {
+                let data = SafeTensors::deserialize(data)?;
+                let blend = Default::default();
+                let lora = Lora { data, blend };
+                builder.lora(lora)
+            }
+            None => builder,
+        };
+
+        let runtime: Box<dyn Runtime<Rnn>> = match info.version {
+            ModelVersion::V4 => {
+                let context = context.clone();
+                let model = builder.build_v4().await?;
+                let f = move || serde::<v4::Model>(cli.output, &context, model);
+                let model = tokio::task::spawn_blocking(f).await??;
+                let bundle = v4::Bundle::<f16>::new(model, 1);
+                Box::new(TokioRuntime::new(bundle).await)
+            }
+            ModelVersion::V5 => {
+                let context = context.clone();
+                let model = builder.build_v5().await?;
+                let f = move || serde::<v5::Model>(cli.output, &context, model);
+                let model = tokio::task::spawn_blocking(f).await??;
+                let bundle = v5::Bundle::<f16>::new(model, 1);
+                Box::new(TokioRuntime::new(bundle).await)
+            }
+            ModelVersion::V6 => {
+                let context = context.clone();
+                let model = builder.build_v6().await?;
+                let f = move || serde::<v6::Model>(cli.output, &context, model);
+                let model = tokio::task::spawn_blocking(f).await??;
+                let bundle = v6::Bundle::<f16>::new(model, 1);
+                Box::new(TokioRuntime::new(bundle).await)
+            }
+            ModelVersion::V7 => {
+                let context = context.clone();
+                let model = builder.build_v7().await?;
+                let f = move || serde::<v7::Model>(cli.output, &context, model);
+                let model = tokio::task::spawn_blocking(f).await??;
+                let bundle = v7::Bundle::<f16>::new(model, 1);
+                Box::new(TokioRuntime::new(bundle).await)
+            }
+            ModelVersion::Brumby => {
+                let context = context.clone();
+                let model = builder.build_brumby().await?;
+                let f = move || serde::<brumby::Model>(cli.output, &context, model);
+                let model = tokio::task::spawn_blocking(f).await??;
+                let bundle = brumby::Bundle::<f16>::new(model, 1);
+                Box::new(TokioRuntime::new(bundle).await)
+            }
+        };
+
+        (context, info, runtime)
     };
 
-    let runtime: Box<dyn Runtime<Rnn>> = match info.version {
-        ModelVersion::V4 => {
-            let context = context.clone();
-            let model = builder.build_v4().await?;
-            let f = move || serde::<v4::Model>(cli.output, &context, model);
-            let model = tokio::task::spawn_blocking(f).await??;
-            let bundle = v4::Bundle::<f16>::new(model, 1);
-            Box::new(TokioRuntime::new(bundle).await)
-        }
-        ModelVersion::V5 => {
-            let context = context.clone();
-            let model = builder.build_v5().await?;
-            let f = move || serde::<v5::Model>(cli.output, &context, model);
-            let model = tokio::task::spawn_blocking(f).await??;
-            let bundle = v5::Bundle::<f16>::new(model, 1);
-            Box::new(TokioRuntime::new(bundle).await)
-        }
-        ModelVersion::V6 => {
-            let context = context.clone();
-            let model = builder.build_v6().await?;
-            let f = move || serde::<v6::Model>(cli.output, &context, model);
-            let model = tokio::task::spawn_blocking(f).await??;
-            let bundle = v6::Bundle::<f16>::new(model, 1);
-            Box::new(TokioRuntime::new(bundle).await)
-        }
-        ModelVersion::V7 => {
-            let context = context.clone();
-            let model = builder.build_v7().await?;
-            let f = move || serde::<v7::Model>(cli.output, &context, model);
-            let model = tokio::task::spawn_blocking(f).await??;
-            let bundle = v7::Bundle::<f16>::new(model, 1);
-            Box::new(TokioRuntime::new(bundle).await)
-        }
-    };
+    let tokenizer = load_tokenizer(&cli.model, info.version).await?;
 
     const PROMPT: &str = include_str!("prompt.md");
     let tokens = tokenizer.encode(PROMPT.as_bytes())?;

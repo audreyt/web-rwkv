@@ -151,6 +151,274 @@ impl Tokenizer {
     }
 }
 
+// Private types for HuggingFace tokenizer.json deserialization.
+#[derive(Clone, serde::Deserialize)]
+struct HfPreTokenizer {
+    #[serde(default)]
+    pattern: Option<HfPatternObj>,
+    #[serde(default)]
+    pretokenizers: Option<Vec<HfPreTokenizer>>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct HfPatternObj {
+    #[serde(rename = "Regex", default)]
+    regex: Option<String>,
+}
+
+/// A BPE tokenizer compatible with HuggingFace `tokenizer.json` format.
+///
+/// Used by Brumby (Qwen3-based) models. Supports the standard BPE encoding
+/// algorithm with byte-level fallback and a pre-tokenization regex.
+#[derive(Debug, Clone)]
+pub struct BpeTokenizer {
+    /// Token bytes -> token ID.
+    encoder: HashMap<Vec<u8>, u32>,
+    /// Token ID -> token bytes.
+    decoder: Vec<Vec<u8>>,
+    /// Merge priority: (left, right) -> rank (lower = higher priority).
+    merge_ranks: HashMap<(Vec<u8>, Vec<u8>), usize>,
+    /// Pre-tokenization regex pattern.
+    pat: regex::Regex,
+}
+
+impl BpeTokenizer {
+    /// Construct a BPE tokenizer from a HuggingFace `tokenizer.json` file.
+    pub fn new(tokenizer_json: &str) -> Result<Self, TokenizerError> {
+        #[derive(serde::Deserialize)]
+        struct TokenizerJson {
+            model: ModelJson,
+            #[serde(default)]
+            added_tokens: Vec<AddedToken>,
+            #[serde(default)]
+            pre_tokenizer: Option<HfPreTokenizer>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ModelJson {
+            vocab: std::collections::HashMap<String, u32>,
+            #[serde(deserialize_with = "deserialize_merges")]
+            merges: Vec<String>,
+        }
+
+        /// Accept merges as either `["a", "b"]` arrays or `"a b"` strings.
+        fn deserialize_merges<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<String>, D::Error> {
+            #[derive(serde::Deserialize)]
+            #[serde(untagged)]
+            enum MergeEntry {
+                Str(String),
+                Pair([String; 2]),
+            }
+            let entries: Vec<MergeEntry> = serde::Deserialize::deserialize(deserializer)?;
+            Ok(entries
+                .into_iter()
+                .map(|e| match e {
+                    MergeEntry::Str(s) => s,
+                    MergeEntry::Pair([a, b]) => format!("{a} {b}"),
+                })
+                .collect())
+        }
+
+        #[derive(serde::Deserialize)]
+        struct AddedToken {
+            id: u32,
+            content: String,
+        }
+
+        let parsed: TokenizerJson = serde_json::from_str(tokenizer_json)
+            .map_err(TokenizerError::FailedToParseVocabulary)?;
+
+        // Build encoder map. Vocab keys use HuggingFace's byte-level encoding
+        // where each byte is mapped to a printable unicode character.
+        let mut encoder = HashMap::new();
+        let mut max_id: u32 = 0;
+        for (token_str, id) in &parsed.model.vocab {
+            let bytes = Self::hf_decode_token(token_str);
+            encoder.insert(bytes, *id);
+            max_id = max_id.max(*id);
+        }
+
+        // Add special/added tokens.
+        for at in &parsed.added_tokens {
+            let bytes = at.content.as_bytes().to_vec();
+            encoder.insert(bytes, at.id);
+            max_id = max_id.max(at.id);
+        }
+
+        // Build decoder (id -> bytes).
+        let mut decoder = vec![vec![]; (max_id + 1) as usize];
+        for (bytes, &id) in &encoder {
+            decoder[id as usize] = bytes.clone();
+        }
+
+        // Build merge ranks.
+        let mut merge_ranks = HashMap::new();
+        for (rank, merge_str) in parsed.model.merges.iter().enumerate() {
+            if let Some((left, right)) = merge_str.split_once(' ') {
+                let left = Self::hf_decode_token(left);
+                let right = Self::hf_decode_token(right);
+                merge_ranks.insert((left, right), rank);
+            }
+        }
+
+        // Extract pre-tokenization regex pattern.
+        // Note: Rust's `regex` crate does not support lookaheads (e.g. `(?!\S)`).
+        // We strip the unsupported `\s+(?!\S)|` prefix from the trailing whitespace
+        // alternatives, leaving just `\s+` which is functionally equivalent.
+        let pat_str = Self::extract_pattern(&parsed.pre_tokenizer).unwrap_or_else(|| {
+            // Default Qwen3/GPT-4 pattern for byte-level BPE (without lookahead).
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+".to_string()
+        });
+        // Strip lookahead constructs that Rust's regex crate doesn't support.
+        let pat_str = Self::strip_lookaheads(&pat_str);
+        let pat = regex::Regex::new(&pat_str).map_err(|_| TokenizerError::NoMatchingTokenFound)?;
+
+        Ok(Self {
+            encoder,
+            decoder,
+            merge_ranks,
+            pat,
+        })
+    }
+
+    /// Decode a HuggingFace byte-level BPE token string to raw bytes.
+    fn hf_decode_token(token: &str) -> Vec<u8> {
+        token.chars().map(Self::hf_char_to_byte).collect()
+    }
+
+    /// Reverse the HuggingFace byte-to-unicode mapping.
+    fn hf_char_to_byte(c: char) -> u8 {
+        let cp = c as u32;
+        // HF byte-level BPE maps:
+        //   bytes 33..=126 -> same codepoint (printable ASCII)
+        //   bytes 161..=172, 174..=255 -> same codepoint (Latin-1)
+        //   remaining 68 bytes (0..=32, 127..=160, 173) -> U+0100..U+0143
+        match cp {
+            33..=126 | 161..=172 | 174..=255 => cp as u8,
+            _ => {
+                let idx = cp - 256;
+                if idx <= 32 {
+                    idx as u8
+                } else if idx <= 66 {
+                    (idx - 33 + 127) as u8
+                } else {
+                    173u8
+                }
+            }
+        }
+    }
+
+    /// Extract regex pattern from the pre_tokenizer JSON structure.
+    fn extract_pattern(pre_tok: &Option<HfPreTokenizer>) -> Option<String> {
+        let pt = pre_tok.as_ref()?;
+        if let Some(pat) = &pt.pattern {
+            if let Some(regex) = &pat.regex {
+                return Some(regex.clone());
+            }
+        }
+        if let Some(pretoks) = &pt.pretokenizers {
+            for sub in pretoks {
+                if let Some(pat) = Self::extract_pattern(&Some(sub.clone())) {
+                    return Some(pat);
+                }
+            }
+        }
+        None
+    }
+
+    /// Strip lookahead/lookbehind constructs that Rust's `regex` crate doesn't support.
+    /// Replaces `\s+(?!\S)|` with nothing (the subsequent `\s+` handles it).
+    fn strip_lookaheads(pat: &str) -> String {
+        pat.replace(r"\s+(?!\S)|", "").replace(r"\s+(?!\s)|", "")
+    }
+
+    /// Encode a string to token IDs using BPE.
+    pub fn encode(&self, input: &[u8]) -> Result<Vec<u32>, TokenizerError> {
+        let text = String::from_utf8_lossy(input);
+        let mut output = Vec::new();
+
+        for mat in self.pat.find_iter(&text) {
+            let piece = mat.as_str().as_bytes();
+            self.bpe_encode_piece(piece, &mut output)?;
+        }
+
+        Ok(output)
+    }
+
+    /// Decode token IDs back to bytes.
+    pub fn decode(&self, tokens: &[u32]) -> Result<Vec<u8>, TokenizerError> {
+        let mut output = Vec::new();
+        for &token in tokens {
+            let bytes = self
+                .decoder
+                .get(token as usize)
+                .ok_or(TokenizerError::OutOfRangeToken(token))?;
+            output.extend_from_slice(bytes);
+        }
+        Ok(output)
+    }
+
+    /// BPE encode a single pre-tokenized piece.
+    fn bpe_encode_piece(
+        &self,
+        piece: &[u8],
+        output: &mut Vec<u32>,
+    ) -> Result<(), TokenizerError> {
+        if piece.is_empty() {
+            return Ok(());
+        }
+
+        // Start with individual bytes as tokens.
+        let mut parts: Vec<Vec<u8>> = piece.iter().map(|&b| vec![b]).collect();
+
+        // Iteratively merge the highest-priority (lowest rank) pair.
+        loop {
+            if parts.len() < 2 {
+                break;
+            }
+
+            let mut best_rank = usize::MAX;
+            let mut best_idx = 0;
+            for i in 0..parts.len() - 1 {
+                if let Some(&rank) =
+                    self.merge_ranks.get(&(parts[i].clone(), parts[i + 1].clone()))
+                {
+                    if rank < best_rank {
+                        best_rank = rank;
+                        best_idx = i;
+                    }
+                }
+            }
+
+            if best_rank == usize::MAX {
+                break;
+            }
+
+            let right = parts.remove(best_idx + 1);
+            parts[best_idx].extend_from_slice(&right);
+        }
+
+        // Map merged byte sequences to token IDs.
+        for part in &parts {
+            if let Some(&id) = self.encoder.get(part) {
+                output.push(id);
+            } else {
+                for &b in part {
+                    if let Some(&id) = self.encoder.get(&vec![b]) {
+                        output.push(id);
+                    } else {
+                        return Err(TokenizerError::NoMatchingTokenFound);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[wasm_bindgen(js_name = Tokenizer)]
 pub struct JsTokenizer(Tokenizer);
 
@@ -159,6 +427,25 @@ impl JsTokenizer {
     #[wasm_bindgen(constructor)]
     pub fn new(vocab: &str) -> Result<Self, JsError> {
         Ok(Self(Tokenizer::new(vocab)?))
+    }
+
+    pub fn encode(&self, input: &[u8]) -> Result<Vec<u32>, JsError> {
+        Ok(self.0.encode(input)?)
+    }
+
+    pub fn decode(&self, tokens: &[u32]) -> Result<Vec<u8>, JsError> {
+        Ok(self.0.decode(tokens)?)
+    }
+}
+
+#[wasm_bindgen(js_name = BpeTokenizer)]
+pub struct JsBpeTokenizer(BpeTokenizer);
+
+#[wasm_bindgen(js_class = BpeTokenizer)]
+impl JsBpeTokenizer {
+    #[wasm_bindgen(constructor)]
+    pub fn new(tokenizer_json: &str) -> Result<Self, JsError> {
+        Ok(Self(BpeTokenizer::new(tokenizer_json)?))
     }
 
     pub fn encode(&self, input: &[u8]) -> Result<Vec<u32>, JsError> {

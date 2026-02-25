@@ -366,22 +366,27 @@ impl Context {
     }
 
     pub(crate) fn checkout_buffer_init(&self, contents: &[u8], usage: BufferUsages) -> Arc<Buffer> {
-        let size = std::mem::size_of_val(contents);
+        // Ensure minimum buffer size of 16 bytes to satisfy GPU storage buffer binding requirements.
+        let contents = if contents.len() < 16 {
+            let mut padded = contents.to_vec();
+            padded.resize(16, 0);
+            std::borrow::Cow::Owned(padded)
+        } else {
+            std::borrow::Cow::Borrowed(contents)
+        };
+        let size = contents.len();
         let _key = BufferKey { size, usage };
         let desc = BufferInitDescriptor {
             label: None,
-            contents,
+            contents: &contents,
             usage,
         };
-        // self.buffer_cache.checkout(
-        //     key,
-        //     || self.device.create_buffer_init(&desc),
-        //     |buffer| self.queue.write_buffer(buffer, 0, contents),
-        // )
         self.device.create_buffer_init(&desc).into()
     }
 
     pub(crate) fn checkout_buffer(&self, size: usize, usage: BufferUsages) -> Arc<Buffer> {
+        // Ensure minimum buffer size of 16 bytes to satisfy GPU storage buffer binding requirements.
+        let size = size.max(16);
         let key = BufferKey { size, usage };
         let desc = BufferDescriptor {
             label: None,
