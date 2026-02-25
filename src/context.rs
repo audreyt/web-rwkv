@@ -41,7 +41,7 @@ impl InstanceExt for Instance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContextId;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 pub struct ContextEvent {
     pub buffer: Arc<Buffer>,
     pub sender: flume::Sender<Box<[u8]>>,
@@ -59,11 +59,11 @@ pub struct Context {
     buffers: ResourceCache<BufferKey, Buffer>,
     bindings: SharedResourceCache<BindGroupKey, BindGroup>,
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     event: flume::Sender<ContextEvent>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 impl Drop for Context {
     fn drop(&mut self) {
         if self.event.sender_count() <= 1 {
@@ -129,7 +129,7 @@ impl ContextBuilder {
             .await
             .map_err(|_| ContextError::RequestDeviceFailed)?;
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
         let (event, receiver) = flume::unbounded();
 
         let context = Context {
@@ -141,12 +141,12 @@ impl ContextBuilder {
             shapes: Default::default(),
             buffers: ResourceCache::new(4),
             bindings: SharedResourceCache::new(64),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
             event,
         };
 
         // start a thread for reading back buffers
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
         {
             let id = context.id;
             let device = context.device.clone();
@@ -425,7 +425,7 @@ impl Context {
         self.buffers.clear();
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     pub(crate) fn event(&self) -> flume::Sender<ContextEvent> {
         self.event.clone()
     }
@@ -441,7 +441,7 @@ impl Context {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 fn read_back_buffer(device: &Device, buffer: &Buffer) -> Box<[u8]> {
     assert!(buffer.usage().contains(BufferUsages::MAP_READ));
 

@@ -1,8 +1,8 @@
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 use futures::future::BoxFuture;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
 use futures::future::LocalBoxFuture;
 use half::f16;
 use itertools::Itertools;
@@ -189,12 +189,12 @@ impl super::model::State for State {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     fn back(&self, batch: usize) -> BoxFuture<'_, Result<TensorCpu<f32>, TensorError>> {
         Box::pin(self.back(batch))
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
     fn back(&self, batch: usize) -> LocalBoxFuture<'_, Result<TensorCpu<f32>, TensorError>> {
         Box::pin(self.back(batch))
     }

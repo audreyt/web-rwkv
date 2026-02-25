@@ -1,8 +1,8 @@
 use std::{future::Future, marker::PhantomData};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 use futures::future::BoxFuture;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
 use futures::future::LocalBoxFuture;
 use thiserror::Error;
 
@@ -42,10 +42,10 @@ pub trait Job {
     fn load(&self, input: &<Self::Input as JobInput>::Chunk) -> Result<(), RuntimeError>;
     /// Submit the job to GPU and execute it immediately.
     fn submit(&mut self);
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     /// Wait for the job to finish and read the data back.
     fn back(self) -> impl Future<Output = Result<Self::Output, RuntimeError>> + Send;
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
     /// Wait for the job to finish and read the data back.
     fn back(self) -> impl Future<Output = Result<Self::Output, RuntimeError>>;
 }
@@ -58,7 +58,7 @@ pub trait Dispatcher<J: Job> {
     fn dispatch(&self, info: Self::Info) -> Result<J, RuntimeError>;
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "tokio"))]
+#[cfg(all(not(any(target_arch = "wasm32", target_arch = "wasm64")), feature = "tokio"))]
 #[allow(clippy::type_complexity)]
 #[derive(Debug)]
 struct Submission<I: infer::Infer> {
@@ -74,16 +74,16 @@ pub enum RuntimeError {
     TensorError(#[from] crate::tensor::TensorError),
     #[error("recv error")]
     RecvError(#[from] flume::RecvError),
-    #[cfg(all(not(target_arch = "wasm32"), feature = "tokio"))]
+    #[cfg(all(not(any(target_arch = "wasm32", target_arch = "wasm64")), feature = "tokio"))]
     #[error("join error")]
     JoinError(#[from] tokio::task::JoinError),
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "tokio"))]
+#[cfg(all(not(any(target_arch = "wasm32", target_arch = "wasm64")), feature = "tokio"))]
 #[derive(Debug, Clone)]
 pub struct TokioRuntime<I: infer::Infer>(flume::Sender<Submission<I>>);
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "tokio"))]
+#[cfg(all(not(any(target_arch = "wasm32", target_arch = "wasm64")), feature = "tokio"))]
 #[allow(clippy::type_complexity)]
 impl<I, T, F> TokioRuntime<I>
 where
@@ -271,17 +271,17 @@ impl<M, I, J> SimpleRuntime<M, I, J> {
 
 #[allow(clippy::type_complexity)]
 pub trait Runtime<I: infer::Infer> {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     fn infer(&self, input: I::Input) -> BoxFuture<'_, Result<(I::Input, I::Output), RuntimeError>>;
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
     fn infer(
         &self,
         input: I::Input,
     ) -> LocalBoxFuture<'_, Result<(I::Input, I::Output), RuntimeError>>;
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "tokio"))]
+#[cfg(all(not(any(target_arch = "wasm32", target_arch = "wasm64")), feature = "tokio"))]
 #[allow(clippy::type_complexity)]
 impl<I, T, F> Runtime<I> for TokioRuntime<I>
 where
@@ -290,13 +290,13 @@ where
     F: Iterator<Item = T> + Send + 'static,
     for<'a> &'a I::Input: IntoIterator<Item = T, IntoIter = F>,
 {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     fn infer(&self, input: I::Input) -> BoxFuture<'_, Result<(I::Input, I::Output), RuntimeError>> {
         Box::pin(self.infer(input))
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 #[allow(clippy::type_complexity)]
 impl<M, I, J, T, F> Runtime<I> for SimpleRuntime<M, I, J>
 where
@@ -312,7 +312,7 @@ where
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
 #[allow(clippy::type_complexity)]
 impl<M, I, J, T, F> Runtime<I> for SimpleRuntime<M, I, J>
 where

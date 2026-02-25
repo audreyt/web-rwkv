@@ -1,34 +1,89 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use half::f16;
+use safetensors::SafeTensorError;
 use wasm_bindgen::prelude::*;
 
 use crate::{
     context::{Context, ContextBuilder, InstanceExt as _},
     runtime::{
-        brumby,
+        brumby::{self, Att, Embed, Ffn, Head, Layer, Model, ModelTensor, RmsNorm},
         infer::{Rnn, RnnInput, RnnInputBatch, RnnOption, Token},
-        loader::{Loader, ShardedSafeTensors},
-        model::{Bundle as _, ContextAutoLimits as _, ModelBuilder, Quant, State as _},
+        loader::{Loader, Reader, ReaderTensor, TensorFromReader as _, PAD_MAT},
+        model::{Bundle as _, ContextAutoLimits as _, ModelBuilder, ModelCustomInfo, ModelInfo, Quant, State as _},
         softmax, SimpleRuntime,
     },
-    tensor::TensorInit as _,
+    tensor::{kind::ReadWrite, matrix::Matrix, TensorCpu, TensorGpu, TensorInit as _, TensorInto as _, TensorShape as _},
 };
 
 type BrumbyBundle = brumby::Bundle<f16>;
 type BrumbyRuntime = SimpleRuntime<BrumbyBundle, Rnn, brumby::RnnJob>;
 
-/// Incremental builder for sharded models.
-///
-/// Holds shard bytes in WASM linear memory so JS can release each
-/// `Uint8Array` after calling `add_shard`, keeping peak JS heap small.
+// ── MetadataReader ─────────────────────────────────────────
+// A Reader backed only by tensor names and shapes (no data).
+// Used to compute ModelInfo without loading any tensor bytes.
+
+struct MetadataReader {
+    all_names: Vec<String>,
+    shapes: HashMap<String, Vec<usize>>,
+}
+
+impl Reader for MetadataReader {
+    fn names(&self) -> Vec<&str> {
+        self.all_names.iter().map(|s| s.as_str()).collect()
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.all_names.iter().any(|n| n == name)
+    }
+
+    fn shape(&self, name: &str) -> Result<Vec<usize>, SafeTensorError> {
+        self.shapes
+            .get(name)
+            .cloned()
+            .ok_or(SafeTensorError::TensorNotFound(name.to_string()))
+    }
+
+    fn tensor(&self, name: &str) -> Result<ReaderTensor<'_>, SafeTensorError> {
+        Err(SafeTensorError::TensorNotFound(format!(
+            "metadata-only reader: {name}"
+        )))
+    }
+}
+
+// ── WasmSessionBuilder (streaming) ─────────────────────────
+// Uploads tensors to GPU during add_shard(), keeping peak WASM
+// memory at ~1 shard (~4 GB) instead of all shards (~12 GB).
+
 #[wasm_bindgen]
 pub struct WasmSessionBuilder {
-    index_json: String,
-    shard_names: Vec<String>,
-    shard_data: Vec<Vec<u8>>,
+    /// Tensor name → shard filename, from the index JSON.
+    #[wasm_bindgen(skip)]
+    pub weight_map: HashMap<String, String>,
+
     token_chunk_size: u32,
     quant_layers: u32,
+
+    /// GPU context, created in prepare().
+    #[wasm_bindgen(skip)]
+    pub context: Option<Context>,
+
+    /// Accumulated tensor shapes from parsed shard headers.
+    #[wasm_bindgen(skip)]
+    pub tensor_meta: HashMap<String, Vec<usize>>,
+
+    /// Pre-uploaded vector tensors (norms, biases) on GPU.
+    #[wasm_bindgen(skip)]
+    pub gpu_vectors: HashMap<String, TensorGpu<f16, ReadWrite>>,
+
+    /// Pre-uploaded weight matrices on GPU (possibly quantized).
+    #[wasm_bindgen(skip)]
+    pub matrices: HashMap<String, Matrix>,
+
+    /// Embedding weight — stays on CPU (padded).
+    #[wasm_bindgen(skip)]
+    pub embed_cpu: Option<TensorCpu<f16>>,
 }
 
 #[wasm_bindgen]
@@ -38,37 +93,436 @@ impl WasmSessionBuilder {
         index_json: &str,
         token_chunk_size: u32,
         quant_layers: u32,
-    ) -> WasmSessionBuilder {
-        WasmSessionBuilder {
-            index_json: index_json.to_string(),
-            shard_names: Vec::new(),
-            shard_data: Vec::new(),
+    ) -> Result<WasmSessionBuilder, JsError> {
+        #[derive(serde::Deserialize)]
+        struct IndexJson {
+            weight_map: HashMap<String, String>,
+        }
+
+        let parsed: IndexJson = serde_json::from_str(index_json)
+            .map_err(|e| JsError::new(&format!("Invalid index JSON: {e}")))?;
+
+        Ok(WasmSessionBuilder {
+            weight_map: parsed.weight_map,
             token_chunk_size,
             quant_layers,
-        }
+            context: None,
+            tensor_meta: HashMap::new(),
+            gpu_vectors: HashMap::new(),
+            matrices: HashMap::new(),
+            embed_cpu: None,
+        })
     }
 
-    /// Copy one shard's bytes into WASM memory. JS can free the buffer afterwards.
-    pub fn add_shard(&mut self, name: &str, data: &[u8]) {
-        self.shard_names.push(name.to_string());
-        self.shard_data.push(data.to_vec());
+    /// Create the WebGPU context. Must be called before add_shard().
+    pub async fn prepare(&mut self) -> Result<(), JsError> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .adapter(wgpu::PowerPreference::HighPerformance)
+            .await
+            .map_err(|e| JsError::new(&format!("WebGPU adapter error: {e}")))?;
+
+        let mut ctx_builder = ContextBuilder::new(adapter);
+        // Use generous limits; the adapter will clamp to what it supports.
+        ctx_builder.limits.max_buffer_size = 1 << 30; // 1 GB
+        ctx_builder.limits.max_storage_buffer_binding_size = 1 << 30;
+
+        let context = ctx_builder
+            .build()
+            .await
+            .map_err(|e| JsError::new(&format!("Context error: {e}")))?;
+
+        self.context = Some(context);
+        Ok(())
     }
 
-    /// Consume the builder and produce a ready-to-use `WasmSession`.
-    pub async fn build(self) -> Result<WasmSession, JsError> {
-        let shard_files: Vec<(&str, &[u8])> = self
-            .shard_names
+    /// Parse one shard and upload all its tensors to GPU.
+    ///
+    /// The shard's bytes live in WASM memory only for the duration of this
+    /// call — after it returns, the staging buffer is freed by the JS glue.
+    ///
+    /// NOTE: For shards > ~4 GB, use `add_tensor()` + `flush()` instead,
+    /// because browsers limit a single JS ArrayBuffer to ~4 GB.
+    pub fn add_shard(&mut self, name: &str, data: &[u8]) -> Result<(), JsError> {
+        // Clone the context to avoid borrow conflict (Context is Arc-based, clone is cheap).
+        let context = self
+            .context
+            .clone()
+            .ok_or_else(|| JsError::new("call prepare() before add_shard()"))?;
+
+        let st = safetensors::SafeTensors::deserialize(data)
+            .map_err(|e| JsError::new(&format!("SafeTensor parse error: {e}")))?;
+
+        // Collect tensor names that belong to this shard.
+        let shard_tensors: Vec<String> = self
+            .weight_map
             .iter()
-            .zip(self.shard_data.iter())
-            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .filter(|(_, shard_file)| shard_file.as_str() == name)
+            .map(|(tensor_name, _)| tensor_name.clone())
             .collect();
 
-        let model = ShardedSafeTensors::new(&self.index_json, &shard_files)
-            .map_err(|e| JsError::new(&format!("Sharded model parse error: {e}")))?;
+        for tensor_name in &shard_tensors {
+            let tv = st.tensor(tensor_name).map_err(|e| {
+                JsError::new(&format!("Missing tensor {tensor_name} in shard {name}: {e}"))
+            })?;
 
-        WasmSession::build_from_reader(model, self.token_chunk_size, self.quant_layers).await
+            // Accumulate metadata for later ModelInfo computation.
+            self.tensor_meta
+                .insert(tensor_name.clone(), tv.shape().to_vec());
+
+            let reader_tensor: ReaderTensor<'_> =
+                (tv.dtype(), tv.shape().to_vec(), Cow::Borrowed(tv.data()));
+
+            self.upload_tensor(tensor_name, reader_tensor, &context)?;
+        }
+
+        // Flush GPU uploads.
+        let submission_index = Some(context.queue.submit(None));
+        _ = context.device.poll(wgpu::PollType::Wait {
+            submission_index,
+            timeout: None,
+        });
+
+        Ok(())
+    }
+
+    /// Add a single tensor by name, shape, dtype string, and raw bytes.
+    ///
+    /// Call this from JS after parsing the safetensors header on the JS side.
+    /// This avoids loading an entire shard into one ArrayBuffer (which fails
+    /// for shards > ~4 GB due to browser limits).
+    ///
+    /// `dtype` must be a safetensors dtype string: "F16", "F32", "BF16", etc.
+    pub fn add_tensor(
+        &mut self,
+        name: &str,
+        shape: &[u32],
+        dtype: &str,
+        data: &[u8],
+    ) -> Result<(), JsError> {
+        let context = self
+            .context
+            .clone()
+            .ok_or_else(|| JsError::new("call prepare() before add_tensor()"))?;
+
+        let st_dtype = match dtype {
+            "F16" => safetensors::Dtype::F16,
+            "F32" => safetensors::Dtype::F32,
+            "BF16" => safetensors::Dtype::BF16,
+            "I32" => safetensors::Dtype::I32,
+            "I64" => safetensors::Dtype::I64,
+            "U8" => safetensors::Dtype::U8,
+            "U16" => safetensors::Dtype::U16,
+            "U32" => safetensors::Dtype::U32,
+            "I8" => safetensors::Dtype::I8,
+            "I16" => safetensors::Dtype::I16,
+            _ => return Err(JsError::new(&format!("Unknown dtype: {dtype}"))),
+        };
+
+        let shape_usize: Vec<usize> = shape.iter().map(|&s| s as usize).collect();
+
+        // Record metadata for later ModelInfo computation.
+        self.tensor_meta
+            .insert(name.to_string(), shape_usize.clone());
+
+        // Upload to GPU (or keep on CPU for embed).
+        let reader_tensor: ReaderTensor<'_> = (st_dtype, shape_usize, Cow::Borrowed(data));
+        self.upload_tensor(name, reader_tensor, &context)?;
+
+        Ok(())
+    }
+
+    /// Flush pending GPU uploads. Call after a batch of add_tensor() calls
+    /// (typically once per shard).
+    pub fn flush(&self) -> Result<(), JsError> {
+        let context = self
+            .context
+            .as_ref()
+            .ok_or_else(|| JsError::new("call prepare() before flush()"))?;
+        let submission_index = Some(context.queue.submit(None));
+        _ = context.device.poll(wgpu::PollType::Wait {
+            submission_index,
+            timeout: None,
+        });
+        Ok(())
+    }
+
+    /// Assemble the model from pre-uploaded GPU tensors.
+    pub async fn build(mut self) -> Result<WasmSession, JsError> {
+        let context = self
+            .context
+            .take()
+            .ok_or_else(|| JsError::new("call prepare() before build()"))?;
+
+        let info = self.compute_model_info()?;
+        let ModelCustomInfo::Brumby(custom) = info.custom else {
+            return Err(JsError::new("Expected Brumby/PowerCoder model"));
+        };
+        let use_bias = !custom.has_qk_norm;
+
+        // ── Embed ──
+        let embed = Embed {
+            w: self
+                .embed_cpu
+                .take()
+                .ok_or_else(|| JsError::new("missing model.embed_tokens.weight"))?,
+        };
+
+        // ── Head ──
+        let head = Head {
+            ln: self.take_rms_norm("model.norm", use_bias, &context)?,
+            w: self.take_matrix("lm_head.weight")?,
+        };
+
+        // Sync after head
+        let submission_index = Some(context.queue.submit(None));
+        _ = context.device.poll(wgpu::PollType::Wait {
+            submission_index,
+            timeout: None,
+        });
+
+        // ── Layers ──
+        let mut layers = vec![];
+        for layer_idx in 0..info.num_layer {
+            let l = format!("model.layers.{layer_idx}");
+
+            let input_ln =
+                self.take_rms_norm(&format!("{l}.input_layernorm"), use_bias, &context)?;
+
+            let att = Att {
+                q_proj: self.take_matrix(&format!("{l}.self_attn.q_proj.weight"))?,
+                k_proj: self.take_matrix(&format!("{l}.self_attn.k_proj.weight"))?,
+                v_proj: self.take_matrix(&format!("{l}.self_attn.v_proj.weight"))?,
+                o_proj: self.take_matrix(&format!("{l}.self_attn.o_proj.weight"))?,
+                g_proj: self.take_matrix(&format!("{l}.self_attn.g_proj.weight"))?,
+                q_norm: if custom.has_qk_norm {
+                    Some(self.take_rms_norm(
+                        &format!("{l}.self_attn.q_norm"),
+                        false,
+                        &context,
+                    )?)
+                } else {
+                    None
+                },
+                k_norm: if custom.has_qk_norm {
+                    Some(self.take_rms_norm(
+                        &format!("{l}.self_attn.k_norm"),
+                        false,
+                        &context,
+                    )?)
+                } else {
+                    None
+                },
+                q_bias: self.take_optional_vector(
+                    &format!("{l}.self_attn.q_proj.bias"),
+                    use_bias,
+                )?,
+                k_bias: self.take_optional_vector(
+                    &format!("{l}.self_attn.k_proj.bias"),
+                    use_bias,
+                )?,
+                v_bias: self.take_optional_vector(
+                    &format!("{l}.self_attn.v_proj.bias"),
+                    use_bias,
+                )?,
+                o_bias: self.take_optional_vector(
+                    &format!("{l}.self_attn.o_proj.bias"),
+                    use_bias,
+                )?,
+                g_bias: self.take_optional_vector(
+                    &format!("{l}.self_attn.g_proj.bias"),
+                    use_bias,
+                )?,
+            };
+
+            let post_att_ln = self.take_rms_norm(
+                &format!("{l}.post_attention_layernorm"),
+                use_bias,
+                &context,
+            )?;
+
+            let ffn = if custom.gated_ffn {
+                Ffn::Gated {
+                    gate_proj: self.take_matrix(&format!("{l}.mlp.gate_proj.weight"))?,
+                    up_proj: self.take_matrix(&format!("{l}.mlp.up_proj.weight"))?,
+                    down_proj: self.take_matrix(&format!("{l}.mlp.down_proj.weight"))?,
+                }
+            } else {
+                Ffn::Dense {
+                    c_fc: self.take_matrix(&format!("{l}.mlp.c_fc.weight"))?,
+                    c_fc_bias: self
+                        .take_optional_vector(&format!("{l}.mlp.c_fc.bias"), use_bias)?,
+                    c_proj: self.take_matrix(&format!("{l}.mlp.c_proj.weight"))?,
+                    c_proj_bias: self
+                        .take_optional_vector(&format!("{l}.mlp.c_proj.bias"), use_bias)?,
+                }
+            };
+
+            // GPU sync after each layer to release staging buffers
+            let submission_index = Some(context.queue.submit(None));
+            _ = context.device.poll(wgpu::PollType::Wait {
+                submission_index,
+                timeout: None,
+            });
+
+            layers.push(Layer {
+                input_ln,
+                post_att_ln,
+                att,
+                ffn,
+            });
+        }
+
+        let tensor = ModelTensor {
+            embed,
+            head,
+            layers,
+        };
+        let model = Model {
+            context: context.clone(),
+            info: info.clone(),
+            rescale: Model::DEFAULT_RESCALE,
+            sep: Model::DEFAULT_SEP,
+            tensor,
+        };
+
+        let num_vocab = info.num_vocab;
+        let bundle = BrumbyBundle::new(model, 1);
+        let runtime = SimpleRuntime::new(bundle);
+
+        Ok(WasmSession {
+            context,
+            runtime,
+            num_vocab,
+            token_chunk_size: self.token_chunk_size.max(32) as usize,
+            info,
+        })
     }
 }
+
+// ── Private helpers on the builder ─────────────────────────
+
+impl WasmSessionBuilder {
+    /// Upload a single tensor to GPU (or CPU for embed).
+    fn upload_tensor(
+        &mut self,
+        name: &str,
+        reader_tensor: ReaderTensor<'_>,
+        context: &Context,
+    ) -> Result<(), JsError> {
+        let shape = &reader_tensor.1;
+        let is_1d = shape.len() <= 1;
+
+        // Embedding weight: pad and keep on CPU.
+        if name == "model.embed_tokens.weight" {
+            let cpu = TensorCpu::<f16>::from_reader(reader_tensor)
+                .map_err(|e| JsError::new(&format!("Tensor error ({name}): {e}")))?
+                .pad(PAD_MAT);
+            self.embed_cpu = Some(cpu);
+            return Ok(());
+        }
+
+        // Head weight: pad, upload to GPU as Matrix::Fp16.
+        if name == "lm_head.weight" {
+            let gpu = TensorCpu::<f16>::from_reader(reader_tensor)
+                .map_err(|e| JsError::new(&format!("Tensor error ({name}): {e}")))?
+                .pad(PAD_MAT)
+                .to(context);
+            self.matrices
+                .insert(name.to_string(), Matrix::Fp16(gpu));
+            return Ok(());
+        }
+
+        if is_1d {
+            // Vector (norm weight / bias): upload as f16.
+            let gpu = TensorCpu::<f16>::from_reader(reader_tensor)
+                .map_err(|e| JsError::new(&format!("Tensor error ({name}): {e}")))?
+                .to(context);
+            self.gpu_vectors.insert(name.to_string(), gpu);
+        } else {
+            // Weight matrix: upload as f16, optionally quantize.
+            let gpu: TensorGpu<f16, ReadWrite> = TensorCpu::<f16>::from_reader(reader_tensor)
+                .map_err(|e| JsError::new(&format!("Tensor error ({name}): {e}")))?
+                .to(context);
+
+            let layer_idx = Self::extract_layer_index(name);
+            let should_quantize = layer_idx
+                .map(|idx| idx < self.quant_layers as usize)
+                .unwrap_or(false);
+
+            if should_quantize {
+                let matrix = Matrix::quant_u8(&gpu)
+                    .map_err(|e| JsError::new(&format!("Quant error ({name}): {e}")))?;
+                self.matrices.insert(name.to_string(), matrix);
+                // gpu (f16 original) is dropped, freeing GPU memory.
+            } else {
+                self.matrices
+                    .insert(name.to_string(), Matrix::Fp16(gpu));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract layer index from tensor names like "model.layers.5.self_attn.q_proj.weight".
+    fn extract_layer_index(name: &str) -> Option<usize> {
+        let rest = name.strip_prefix("model.layers.")?;
+        let dot = rest.find('.')?;
+        rest[..dot].parse().ok()
+    }
+
+    /// Compute ModelInfo from accumulated tensor metadata.
+    fn compute_model_info(&self) -> Result<ModelInfo, JsError> {
+        let all_names: Vec<String> = self.weight_map.keys().cloned().collect();
+        let meta_reader = MetadataReader {
+            all_names,
+            shapes: self.tensor_meta.clone(),
+        };
+        Loader::<MetadataReader>::info(&meta_reader)
+            .map_err(|e| JsError::new(&format!("Model info error: {e}")))
+    }
+
+    fn take_vector(&mut self, name: &str) -> Result<TensorGpu<f16, ReadWrite>, JsError> {
+        self.gpu_vectors
+            .remove(name)
+            .ok_or_else(|| JsError::new(&format!("missing vector tensor: {name}")))
+    }
+
+    fn take_matrix(&mut self, name: &str) -> Result<Matrix, JsError> {
+        self.matrices
+            .remove(name)
+            .ok_or_else(|| JsError::new(&format!("missing matrix tensor: {name}")))
+    }
+
+    fn take_rms_norm(
+        &mut self,
+        prefix: &str,
+        has_bias: bool,
+        context: &Context,
+    ) -> Result<RmsNorm, JsError> {
+        let w = self.take_vector(&format!("{prefix}.weight"))?;
+        let b = if has_bias {
+            self.take_vector(&format!("{prefix}.bias"))?
+        } else {
+            context.zeros(w.shape())
+        };
+        Ok(RmsNorm { w, b })
+    }
+
+    fn take_optional_vector(
+        &mut self,
+        name: &str,
+        present: bool,
+    ) -> Result<Option<TensorGpu<f16, ReadWrite>>, JsError> {
+        if present {
+            Ok(Some(self.take_vector(name)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// ── WasmSession ────────────────────────────────────────────
 
 /// A WASM-exported session that wraps the full inference pipeline.
 #[wasm_bindgen]
@@ -77,7 +531,7 @@ pub struct WasmSession {
     runtime: BrumbyRuntime,
     num_vocab: usize,
     token_chunk_size: usize,
-    info: crate::runtime::model::ModelInfo,
+    info: ModelInfo,
 }
 
 #[wasm_bindgen]

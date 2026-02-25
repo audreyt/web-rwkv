@@ -1,8 +1,8 @@
 use std::{any::Any, collections::HashMap};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 use futures::future::BoxFuture;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
 use futures::future::LocalBoxFuture;
 use half::f16;
 use serde::{Deserialize, Serialize};
@@ -91,10 +91,10 @@ pub trait State {
     /// Load a batch of the state from CPU to GPU.
     fn load(&self, tensor: TensorCpu<f32>, batch: usize) -> Result<(), TensorError>;
     /// Read back a batch of the state from GPU to CPU.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     fn back(&self, batch: usize) -> BoxFuture<'_, Result<TensorCpu<f32>, TensorError>>;
     /// Read back a batch of the state from GPU to CPU.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
     fn back(&self, batch: usize) -> LocalBoxFuture<'_, Result<TensorCpu<f32>, TensorError>>;
     /// Write into the state from a GPU tensor.
     fn write(&self, tensor: TensorGpu<f32, ReadWrite>, batch: usize) -> Result<(), TensorError>;
@@ -107,16 +107,16 @@ pub trait State {
 pub trait Bundle {
     /// The model info.
     fn info(&self) -> ModelInfo;
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     /// Get the state from the bundle.
     fn state(&self) -> impl State + AsAny + Send + Sync + 'static;
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
     /// Get the state from the bundle.
     fn state(&self) -> impl State + AsAny + 'static;
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     /// Get the model from the bundle.
     fn model(&self) -> impl Serialize + Send + Sync + 'static;
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
     /// Get the model from the bundle.
     fn model(&self) -> impl Serialize + 'static;
 }

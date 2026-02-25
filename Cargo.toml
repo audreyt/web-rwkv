@@ -100,3 +100,16 @@ tokio = ["dep:tokio"]
 trace = ["tracing", "tracing-subscriber", "tracing-tracy"]
 ## Enables backtrace for errors.
 backtrace = []
+
+[patch.crates-io]
+getrandom = { path = "/tmp/getrandom-wasm64" }
+wasm-bindgen = { path = "/tmp/wasm-bindgen-wasm64" }
+wasm-bindgen-macro = { path = "/tmp/wasm-bindgen-wasm64/crates/macro" }
+wasm-bindgen-macro-support = { path = "/tmp/wasm-bindgen-wasm64/crates/macro-support" }
+wasm-bindgen-shared = { path = "/tmp/wasm-bindgen-wasm64/crates/shared" }
+wasm-bindgen-futures = { path = "/tmp/wasm-bindgen-wasm64/crates/futures" }
+js-sys = { path = "/tmp/wasm-bindgen-wasm64/crates/js-sys" }
+wgpu = { path = "/tmp/wgpu-28.0.0" }
+wgpu-core = { path = "/tmp/wgpu-core-28.0.0" }
+wgpu-hal = { path = "/tmp/wgpu-hal-28.0.0" }
+wgpu-types = { path = "/tmp/wgpu-types-28.0.0" }

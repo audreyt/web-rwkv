@@ -802,10 +802,12 @@ input[type=range]::-moz-range-thumb {
 <script type="module">
 // ── Configuration ──────────────────────────────────────────
 const WASM_MODULE_PATH = './pkg/web_rwkv.js';
-const MODEL_BASE_URL   = './models/brumby-tiny';
-const MODEL_INDEX_FILE = null;  // set to 'model.safetensors.index.json' for sharded models
+const MODEL_BASE_URL   = './models/powercoder-3b';
+const MODEL_INDEX_FILE = 'model.safetensors.index.json';
 const MODEL_FILES      = [
-  'model.safetensors',
+  'model-00001-of-00003.safetensors',
+  'model-00002-of-00003.safetensors',
+  'model-00003-of-00003.safetensors',
 ];
 const TOKENIZER_FILE   = 'tokenizer.json';
 
@@ -993,6 +995,133 @@ async function fetchWithProgress(url, onProgress) {
   return buf;
 }
 
+// ── Streaming safetensors shard reader ──────────────────────
+// Parses the safetensors header from a streaming fetch, then
+// extracts individual tensors without buffering the full shard.
+class ShardReader {
+  constructor(bodyReader) {
+    this.reader = bodyReader;
+    this.chunks = [];
+    this.buffered = 0;
+    this.done = false;
+    this.totalReceived = 0;
+  }
+
+  async ensure(n) {
+    while (this.buffered < n && !this.done) {
+      const { done, value } = await this.reader.read();
+      if (done) { this.done = true; break; }
+      this.chunks.push(value);
+      this.buffered += value.byteLength;
+      this.totalReceived += value.byteLength;
+    }
+    if (this.buffered < n) throw new Error('Unexpected end of safetensors stream');
+  }
+
+  take(n) {
+    const result = new Uint8Array(n);
+    let off = 0;
+    while (off < n) {
+      const chunk = this.chunks[0];
+      const need = n - off;
+      if (chunk.byteLength <= need) {
+        result.set(chunk, off);
+        off += chunk.byteLength;
+        this.buffered -= chunk.byteLength;
+        this.chunks.shift();
+      } else {
+        result.set(chunk.subarray(0, need), off);
+        this.chunks[0] = chunk.subarray(need);
+        this.buffered -= need;
+        off = n;
+      }
+    }
+    return result;
+  }
+
+  skip(n) {
+    let remaining = n;
+    while (remaining > 0) {
+      const chunk = this.chunks[0];
+      if (chunk.byteLength <= remaining) {
+        remaining -= chunk.byteLength;
+        this.buffered -= chunk.byteLength;
+        this.chunks.shift();
+      } else {
+        this.chunks[0] = chunk.subarray(remaining);
+        this.buffered -= remaining;
+        remaining = 0;
+      }
+    }
+  }
+}
+
+/**
+ * Stream-download a safetensors shard and upload tensors one at a time.
+ * This avoids allocating a single ArrayBuffer for the full shard,
+ * which would fail for shards > ~4 GB (browser limit).
+ */
+async function loadShardStreaming(url, builder, onBytesReceived) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching ${url}`);
+
+  const sr = new ShardReader(resp.body.getReader());
+
+  // 1. Read 8-byte header length (u64 LE)
+  await sr.ensure(8);
+  const lenBytes = sr.take(8);
+  const headerLen = Number(new DataView(lenBytes.buffer, lenBytes.byteOffset, 8).getBigUint64(0, true));
+
+  // 2. Read and parse header JSON
+  await sr.ensure(headerLen);
+  const headerBytes = sr.take(headerLen);
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+
+  // 3. Collect and sort tensors by data offset
+  const tensors = [];
+  for (const [name, info] of Object.entries(header)) {
+    if (name === '__metadata__') continue;
+    tensors.push({
+      name,
+      dtype: info.dtype,
+      shape: info.shape,
+      start: info.data_offsets[0],
+      end: info.data_offsets[1],
+    });
+  }
+  tensors.sort((a, b) => a.start - b.start);
+
+  // 4. Read each tensor and upload to GPU
+  let dataPos = 0;
+  let tensorCount = 0;
+  for (const t of tensors) {
+    // Skip any gap between tensors
+    if (t.start > dataPos) {
+      const gap = t.start - dataPos;
+      await sr.ensure(gap);
+      sr.skip(gap);
+      dataPos = t.start;
+    }
+
+    // Read tensor bytes
+    const tensorSize = t.end - t.start;
+    await sr.ensure(tensorSize);
+    const tensorData = sr.take(tensorSize);
+    dataPos = t.end;
+
+    // Upload to GPU via WASM
+    builder.add_tensor(t.name, new Uint32Array(t.shape), t.dtype, tensorData);
+    tensorCount++;
+
+    if (onBytesReceived) onBytesReceived(sr.totalReceived);
+  }
+
+  // 5. Flush GPU uploads
+  builder.flush();
+
+  return { tensorCount, bytesReceived: sr.totalReceived };
+}
+
 // ── Model Loading ──────────────────────────────────────────
 async function loadModel() {
   dom.loadProgress.classList.add('active');
@@ -1028,15 +1157,23 @@ async function loadModel() {
       const indexJson = await indexResp.text();
 
       const builder = new wasmModule.WasmSessionBuilder(indexJson, 128, 0);
+      log('Creating WebGPU context&hellip;');
+      await builder.prepare();
+      log('WebGPU context ready', 'ok');
 
       for (const file of MODEL_FILES) {
-        log(`Downloading ${file}&hellip;`);
-        const buf = await fetchWithProgress(`${MODEL_BASE_URL}/${file}`, onProgress);
-        log(`Loaded ${file} (${(buf.byteLength / 1e6).toFixed(1)} MB)`, 'ok');
-
-        // Copy into WASM memory — JS buffer can be GC'd after this call
-        builder.add_shard(file, buf);
-        loadedBytes += buf.byteLength;
+        log(`Streaming ${file} &rarr; GPU&hellip;`);
+        const shardUrl = `${MODEL_BASE_URL}/${file}`;
+        const { tensorCount, bytesReceived } = await loadShardStreaming(
+          shardUrl, builder,
+          (received) => {
+            const pct = totalBytes > 0 ? ((loadedBytes + received) / totalBytes * 100) : 0;
+            dom.loadBar.style.width = `${pct.toFixed(1)}%`;
+            dom.loadStatus.textContent = `${((loadedBytes + received) / 1e6).toFixed(0)} / ${(totalBytes / 1e6).toFixed(0)} MB`;
+          }
+        );
+        loadedBytes += bytesReceived;
+        log(`${file}: ${tensorCount} tensors uploaded (${(bytesReceived / 1e6).toFixed(1)} MB)`, 'ok');
       }
 
       dom.loadBar.style.width = '100%';
@@ -1063,6 +1200,7 @@ async function loadModel() {
     log(`Model built: ${runtime.version}, ${runtime.num_layer} layers, d=${runtime.num_emb}, vocab=${runtime.num_vocab}`, 'ok');
   } catch (e) {
     log(`Model build: ${e.message}`, 'err');
+    if (e.stack) log(`Stack: ${e.stack}`, 'err');
     dom.loadStatus.textContent = `Error: ${e.message}`;
     modelLoaded = false;
   }
