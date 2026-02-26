@@ -198,7 +198,7 @@ impl WasmSessionBuilder {
         name: &str,
         shape: &[u32],
         dtype: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> Result<(), JsError> {
         let context = self
             .context
@@ -226,7 +226,8 @@ impl WasmSessionBuilder {
             .insert(name.to_string(), shape_usize.clone());
 
         // Upload to GPU (or keep on CPU for embed).
-        let reader_tensor: ReaderTensor<'_> = (st_dtype, shape_usize, Cow::Borrowed(data));
+        // `data` is Vec<u8>: Rust Drop frees it at end of scope (no JS-side free needed).
+        let reader_tensor: ReaderTensor<'_> = (st_dtype, shape_usize, Cow::Owned(data));
         self.upload_tensor(name, reader_tensor, &context)?;
 
         Ok(())
