@@ -1,4 +1,11 @@
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{
+    collections::HashMap,
+    marker::PhantomData,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 use futures::future::BoxFuture;
@@ -27,7 +34,7 @@ use crate::{
         ops::{Activation, TensorCommand, TensorOp},
         serialization::Seed,
         shape::Shape,
-        DeepClone, IntoPackedCursors, TensorCpu, TensorError, TensorGpu, TensorGpuView, TensorInit,
+        Cursor, DeepClone, TensorCpu, TensorError, TensorGpu, TensorGpuView, TensorInit,
         TensorShape, TensorStack,
     },
 };
@@ -49,6 +56,8 @@ pub struct CustomInfo {
     pub hidden_act: Activation,
     /// RoPE theta stored as f32 bits (1e6 for Brumby, 1e4 for PowerCoder).
     pub rope_theta_bits: u32,
+    /// Power retention degree (2 for PowerCoder, 1 for Brumby/linear).
+    pub power_deg: usize,
 }
 
 impl CustomInfo {
@@ -59,6 +68,19 @@ impl CustomInfo {
     pub fn with_rope_theta(mut self, theta: f32) -> Self {
         self.rope_theta_bits = theta.to_bits();
         self
+    }
+
+    /// Compute the expanded state dimension D for symmetric power retention.
+    /// For deg=1: D = head_dim. For deg=2 with head_dim=128: D = 9216.
+    pub fn expanded_dim(&self) -> usize {
+        if self.power_deg <= 1 {
+            self.head_dim
+        } else {
+            let inner = 16usize;
+            let outer = 8usize;
+            ((inner / outer + self.head_dim / outer) * (self.head_dim / inner) / 2)
+                * (inner * outer)
+        }
     }
 }
 
@@ -159,17 +181,23 @@ pub struct Head {
 
 /// Power retention state.
 ///
-/// For each layer, the state contains:
-/// - The retention state matrix S: `[num_head, head_dim, head_dim]` (stored as f32)
-/// - A token shift register: `[num_emb]`
+/// For deg=2 (PowerCoder), the state per layer contains:
+/// - Attention state S: `[kv_dim, D]` where kv_dim = num_kv_heads * head_dim, D = 9216
+/// - Sum-of-keys s: `[num_kv_heads * D]` (flat)
 ///
-/// All packed into a single tensor per layer.
+/// For deg=1 (Brumby), the state per layer contains:
+/// - Attention state S: `[num_emb, head_dim]`
+/// - Token shift: `[num_emb]`
 #[derive(Debug, Clone, Serialize, DeserializeSeed)]
 #[serde_seed(seed = "Seed", context = "Context")]
 pub struct State {
     pub context: Context,
     pub info: ModelInfo,
+    /// Attention state per layer.
     pub data: Vec<TensorGpu<f32, ReadWrite>>,
+    /// Sum-of-keys accumulator per layer (only used for deg=2).
+    #[serde(skip)]
+    pub sum_of_keys: Vec<TensorGpu<f32, ReadWrite>>,
 }
 
 impl State {
@@ -199,6 +227,48 @@ impl AsAny for State {
     }
 }
 
+impl State {
+    fn custom(&self) -> CustomInfo {
+        let ModelCustomInfo::Brumby(custom) = self.info.custom else {
+            unreachable!()
+        };
+        custom
+    }
+
+    fn state_dim0(&self) -> usize {
+        let custom = self.custom();
+        if custom.power_deg >= 2 {
+            custom.num_kv_head * custom.head_dim
+        } else {
+            self.info.num_emb
+        }
+    }
+
+    fn state_dim1(&self) -> usize {
+        let custom = self.custom();
+        if custom.power_deg >= 2 {
+            custom.expanded_dim()
+        } else {
+            custom.head_dim + 1
+        }
+    }
+
+    /// Get the sum-of-keys tensor for a layer (deg=2 only).
+    pub fn sok(&self, layer: usize) -> &TensorGpu<f32, ReadWrite> {
+        &self.sum_of_keys[layer]
+    }
+
+    /// Zero out all sum-of-keys accumulators (for state reset).
+    pub fn reset_sum_of_keys(&self) {
+        for sok in &self.sum_of_keys {
+            let shape = sok.shape();
+            let zeros = vec![0.0f32; shape.len()];
+            let cpu = TensorCpu::from_data(shape, zeros).unwrap();
+            sok.load(&cpu).unwrap();
+        }
+    }
+}
+
 impl super::model::State for State {
     #[inline]
     fn num_batch(&self) -> usize {
@@ -208,9 +278,7 @@ impl super::model::State for State {
     #[inline]
     fn init_shape(&self) -> Shape {
         let info = &self.info;
-        let head_dim = info.num_emb / info.num_head;
-        // State per layer: head_dim rows for the S matrix + 1 row for token shift
-        [info.num_emb, head_dim + 1, info.num_layer, 1].into()
+        [self.state_dim0(), self.state_dim1(), info.num_layer, 1].into()
     }
 
     fn init(&self) -> TensorCpu<f32> {
@@ -220,18 +288,27 @@ impl super::model::State for State {
     }
 
     fn att(&self, layer: usize) -> Result<TensorGpuView<'_, f32>, TensorError> {
-        let head_dim = self.info.num_emb / self.info.num_head;
-        self.data[layer].view(.., 0..head_dim, .., ..)
+        let custom = self.custom();
+        if custom.power_deg >= 2 {
+            // Full tensor is the attention state for deg=2
+            self.data[layer].view(.., .., .., ..)
+        } else {
+            self.data[layer].view(.., 0..custom.head_dim, .., ..)
+        }
     }
 
     fn ffn(&self, layer: usize) -> Result<TensorGpuView<'_, f32>, TensorError> {
-        let head_dim = self.info.num_emb / self.info.num_head;
-        self.data[layer].view(.., head_dim, .., ..)
+        let custom = self.custom();
+        if custom.power_deg >= 2 {
+            // Not used for deg=2; return a dummy single-row view
+            self.data[layer].view(.., 0, .., ..)
+        } else {
+            self.data[layer].view(.., custom.head_dim, .., ..)
+        }
     }
 
     fn load(&self, tensor: TensorCpu<f32>, batch: usize) -> Result<(), TensorError> {
-        let head_dim = self.info.num_emb / self.info.num_head;
-        tensor.check_shape([self.info.num_emb, head_dim + 1, self.info.num_layer, 1])?;
+        tensor.check_shape([self.state_dim0(), self.state_dim1(), self.info.num_layer, 1])?;
         for (data, source) in self.data.iter().zip(tensor.split(2)?.into_iter()) {
             data.load_batch(&source, batch)?;
         }
@@ -249,8 +326,7 @@ impl super::model::State for State {
     }
 
     fn write(&self, tensor: TensorGpu<f32, ReadWrite>, batch: usize) -> Result<(), TensorError> {
-        let head_dim = self.info.num_emb / self.info.num_head;
-        tensor.check_shape([self.info.num_emb, head_dim + 1, self.info.num_layer, 1])?;
+        tensor.check_shape([self.state_dim0(), self.state_dim1(), self.info.num_layer, 1])?;
 
         let context = &self.context;
         let mut ops = Vec::with_capacity(self.data.len());
@@ -267,8 +343,7 @@ impl super::model::State for State {
 
     fn read(&self, batch: usize) -> Result<TensorGpu<f32, ReadWrite>, TensorError> {
         let context = &self.context;
-        let head_dim = self.info.num_emb / self.info.num_head;
-        let shape = [self.info.num_emb, head_dim + 1, self.info.num_layer, 1];
+        let shape = [self.state_dim0(), self.state_dim1(), self.info.num_layer, 1];
         let tensor: TensorGpu<_, _> = context.tensor_init(shape);
 
         let mut ops = Vec::with_capacity(self.data.len());
@@ -291,8 +366,14 @@ impl super::model::State for State {
 impl DeepClone for State {
     fn deep_clone(&self) -> Self {
         let data = self.data.iter().map(|tensor| tensor.deep_clone()).collect();
+        let sum_of_keys = self
+            .sum_of_keys
+            .iter()
+            .map(|tensor| tensor.deep_clone())
+            .collect();
         Self {
             data,
+            sum_of_keys,
             ..self.clone()
         }
     }
@@ -336,7 +417,9 @@ impl<F: Float> Runtime<F> {
         } else {
             custom.num_kv_head
         };
-        let gate_shape = Shape::new(num_gate_head, num_token, 1, 1);
+        // Round up to multiple of 4 to ensure matmul dispatch sizes are non-zero.
+        let num_gate_head_padded = num_gate_head.next_multiple_of(4);
+        let gate_shape = Shape::new(num_gate_head_padded, num_token, 1, 1);
         let ffn_hidden_shape = Shape::new(custom.intermediate_size, num_token, 1, 1);
 
         Self {
@@ -408,6 +491,9 @@ pub struct RnnJob {
     cursors: TensorGpu<u32, ReadWrite>,
     input: TensorGpu<f16, ReadWrite>,
     output: TensorGpu<f32, ReadWrite>,
+
+    /// Shared RoPE position counter — atomically incremented in load().
+    rope_position: Arc<AtomicUsize>,
 }
 
 impl Job for RnnJob {
@@ -444,7 +530,26 @@ impl Job for RnnJob {
             .collect();
         let stack = TensorStack::try_from(stack)?;
 
-        let cursors = stack.cursors.clone().into_cursors();
+        // Create per-token cursors with absolute RoPE positions.
+        // Each token gets a unique incrementing position instead of all sharing
+        // the same cursor (which gave all tokens position 0).
+        let num_token = stack.cursors.iter().map(|c| c.len).sum::<usize>();
+        let offset = self.rope_position.fetch_add(num_token, Ordering::Relaxed);
+        let cursors: Vec<u32> = stack
+            .cursors
+            .iter()
+            .filter(|c| c.len > 0)
+            .flat_map(|cursor| {
+                (0..cursor.len).map(move |i| {
+                    Cursor {
+                        batch: cursor.batch,
+                        token: offset + cursor.token + i,
+                        len: cursor.len,
+                    }
+                    .pack()
+                })
+            })
+            .collect();
         let cursors = TensorCpu::from_data(self.cursors.shape(), cursors)?;
         self.cursors.load(&cursors)?;
         self.input.load(&stack.tensor)?;
@@ -482,11 +587,14 @@ pub type HookMap<F> = HashMap<Hook, HookFn<F>>;
 
 #[derive(Clone)]
 pub struct Bundle<F: Float> {
-    model: Model,
+    pub(crate) model: Model,
     state: State,
     hooks: Arc<HookMap<F>>,
     buffers: ResourceCache<usize, Runtime<F>>,
     headers: ResourceCache<usize, Header<F>>,
+    /// Cumulative RoPE position counter, shared with RnnJobs.
+    /// Atomically incremented by each load() call.
+    pub rope_position: Arc<AtomicUsize>,
     phantom: PhantomData<F>,
 }
 
@@ -495,13 +603,33 @@ impl<F: Float> Bundle<F> {
         let context = model.context.clone();
         let info = model.info.clone();
         let state = {
-            let head_dim = info.num_emb / info.num_head;
-            let shape = Shape::new(info.num_emb, head_dim + 1, num_batch, 1);
-            let data = (0..info.num_layer).map(|_| context.zeros(shape)).collect();
+            let ModelCustomInfo::Brumby(custom) = info.custom else {
+                unreachable!()
+            };
+            let (dim0, dim1) = if custom.power_deg >= 2 {
+                let kv_dim = custom.num_kv_head * custom.head_dim;
+                let expanded_dim = custom.expanded_dim();
+                (kv_dim, expanded_dim)
+            } else {
+                let head_dim = info.num_emb / info.num_head;
+                (info.num_emb, head_dim + 1)
+            };
+            let shape = Shape::new(dim0, dim1, num_batch, 1);
+            let data: Vec<_> = (0..info.num_layer).map(|_| context.zeros(shape)).collect();
+            let sum_of_keys = if custom.power_deg >= 2 {
+                let sok_dim = custom.num_kv_head * custom.expanded_dim();
+                let sok_shape = Shape::new(sok_dim, 1, num_batch, 1);
+                (0..info.num_layer)
+                    .map(|_| context.zeros(sok_shape))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             State {
                 context,
                 info,
                 data,
+                sum_of_keys,
             }
         };
         Self {
@@ -510,6 +638,7 @@ impl<F: Float> Bundle<F> {
             hooks: Default::default(),
             buffers: ResourceCache::new(4),
             headers: ResourceCache::new(4),
+            rope_position: Arc::new(AtomicUsize::new(0)),
             phantom: PhantomData,
         }
     }
@@ -610,6 +739,7 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
                 cursors: buffer.cursors.clone(),
                 input: buffer.input.clone(),
                 output: header.head_o.clone(),
+                rope_position: self.rope_position.clone(),
             });
         }
 
@@ -682,6 +812,7 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
             cursors: buffer.cursors.clone(),
             input: buffer.input.clone(),
             output: header.head_o.clone(),
+            rope_position: self.rope_position.clone(),
         })
     }
 }
@@ -807,6 +938,7 @@ fn dispatch_layer<F: Float>(
     ops.push(TensorOp::power_retention(
         &buffer.cursors,
         state.att(index)?,
+        state.sok(index),
         &buffer.att_g,
         &buffer.att_q,
         &buffer.att_k,
@@ -816,6 +948,7 @@ fn dispatch_layer<F: Float>(
         info.num_head as u32,
         custom.num_kv_head as u32,
         num_gate_head as u32,
+        custom.expanded_dim() as u32,
     )?);
     ops.push(hook_op(Hook::PostAttRetention(index))?);
 

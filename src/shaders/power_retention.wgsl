@@ -18,7 +18,7 @@ struct Input {
 
 // shape from Q tensor meta: [NUM_HEADS * head_dim, num_token, 1, 1]
 @group(0) @binding(0) var<uniform> shape: vec4<u32>;
-// view for state tensor: [num_emb, head_dim, batch, 1]
+// view for state tensor: [kv_dim, D, batch, 1]
 @group(0) @binding(1) var<uniform> view: View;
 @group(0) @binding(2) var<storage, read> cursors: array<u32>;
 @group(0) @binding(3) var<storage, read_write> state: array<vec4<f32>>;
@@ -37,8 +37,12 @@ struct Input {
 @group(0) @binding(8) var<storage, read_write> output: array<vec4<f32>>;
 #endif
 
-var<workgroup> shared_q: array<vec4<f32>, BLOCK_SIZE>;
-var<workgroup> shared_v: array<vec4<f32>, BLOCK_SIZE>;
+@group(0) @binding(9) var<storage, read_write> sum_of_keys: array<f32>;
+
+// Shared memory for K values (all head_dim scalars), Q values per Q-head group, and normalizers.
+var<workgroup> shared_k: array<f32, HEAD_DIM>;
+var<workgroup> shared_q: array<f32, GROUP_RATIO * HEAD_DIM>;
+var<workgroup> shared_l: array<f32, GROUP_RATIO>;
 
 fn compute_index(batch: u32, token: u32, index: u32) -> u32 {
     let stride = view.stride.x >> 2u;
@@ -63,9 +67,9 @@ fn unpack4x16float(x: vec2<u32>) -> vec4<f32> {
 }
 
 fn load_gate(token: u32, head: u32) -> f32 {
-    // Map Q head to gate head (supports both per-head and per-KV-head gates).
-    let gate_head = head * NUM_GATE_HEADS / NUM_HEADS;
-    let flat = token * NUM_GATE_HEADS + gate_head;
+    // Map KV head to gate head.
+    let gate_head = head * NUM_GATE_HEADS / NUM_KV_HEADS;
+    let flat = token * GATE_STRIDE + gate_head;
     let vec_idx = flat / 4u;
     let component = flat % 4u;
 #ifdef FP16
@@ -76,7 +80,7 @@ fn load_gate(token: u32, head: u32) -> f32 {
     return values[component];
 }
 
-fn load_q(index: u32) -> vec4<f32> {
+fn load_q_vec4(index: u32) -> vec4<f32> {
 #ifdef FP16
     return unpack4x16float(q[index]);
 #else
@@ -84,7 +88,7 @@ fn load_q(index: u32) -> vec4<f32> {
 #endif
 }
 
-fn load_k(index: u32) -> vec4<f32> {
+fn load_k_vec4(index: u32) -> vec4<f32> {
 #ifdef FP16
     return unpack4x16float(k[index]);
 #else
@@ -92,7 +96,7 @@ fn load_k(index: u32) -> vec4<f32> {
 #endif
 }
 
-fn load_v(index: u32) -> vec4<f32> {
+fn load_v_vec4(index: u32) -> vec4<f32> {
 #ifdef FP16
     return unpack4x16float(v[index]);
 #else
@@ -108,18 +112,36 @@ fn store_output(index: u32, value: vec4<f32>) {
 #endif
 }
 
-// Power retention for Brumby.
+// Symmetric power retention (deg=2) for Brumby / PowerCoder.
 //
-// Compile-time macros: BLOCK_SIZE, HEAD_SIZE, NUM_HEADS, NUM_KV_HEADS, FP16.
-// BLOCK_SIZE = HEAD_SIZE = head_dim / 4.
+// Compile-time macros:
+//   BLOCK_SIZE = HEAD_SIZE = head_dim / 4 (threads per workgroup)
+//   HEAD_DIM = head_dim (128)
+//   NUM_HEADS = number of Q heads (24)
+//   NUM_KV_HEADS = number of KV heads (2)
+//   GROUP_RATIO = NUM_HEADS / NUM_KV_HEADS (12)
+//   EXPANDED_DIM = D = 9216 (symmetric power expanded dimension)
+//   NUM_BLOCK_PAIRS = 72 (number of block-pairs in upper triangle)
+//   NUM_GATE_HEADS, GATE_STRIDE = gate tensor layout
 //
-// Dispatch: [NUM_HEADS, 1, 1] — one workgroup per Q head.
-// Each workgroup has BLOCK_SIZE threads, each handling one vec4 column of the state.
+// Dispatch: [NUM_KV_HEADS, 1, 1] -- one workgroup per KV head.
+// Each workgroup has BLOCK_SIZE threads, each handling one vec4 column (V-dimension).
 //
-// For each token (sequential):
-//   decay = exp(gate[head, token])
-//   S[head] = decay * S[head] + outer(V[kv_head], K[kv_head])
-//   Y[head] = S[head] @ Q[head]
+// Feature map phi for deg=2 symmetric power:
+//   K is split into outer blocks of 8 and inner blocks of 16.
+//   phi_K[d] = mult * K[a(d)] * K[b(d)]  where a,b derived from block-pair structure.
+//   phi_Q[d] = Q[a(d)] * Q[b(d)]  (no multiplier for Q).
+//   Property: phi(Q) . phi(K) = (Q . K)^2
+//
+// Per token (sequential):
+//   decay = sigmoid(gate[kv_head, token])
+//   For each D-row d:
+//     S[d, col] = decay * S[d, col] + phi_K[d] * V[col]
+//     s[d] = decay * s[d] + phi_K[d]
+//   For each Q head qg in [0, GROUP_RATIO):
+//     Y[qg, col] = sum_d( S[d, col] * phi_Q_qg[d] )
+//     l[qg] = sum_d( s[d] * phi_Q_qg[d] )
+//     O[qg, col] = Y[qg, col] / l[qg]
 //
 @compute @workgroup_size(BLOCK_SIZE, 1, 1)
 fn power_retention(in: Input) {
@@ -127,61 +149,176 @@ fn power_retention(in: Input) {
     let kv_stride = NUM_KV_HEADS * HEAD_SIZE;
     let num_token = shape.y;
 
-    let head = in.wid.x;
+    let kv_head = in.wid.x;
     let idx = in.tid.x;
-    let kv_head = head * NUM_KV_HEADS / NUM_HEADS;
+
+    // Sum-of-keys base offset for this KV head (flat indexing per batch).
+    let sok_stride = NUM_KV_HEADS * EXPANDED_DIM;
 
     for (var t = 0u; t < num_token; t++) {
         let cursor = compute_cursor(cursors[t]);
 
-        // Load Q and V for this token into shared memory.
-        shared_q[idx] = load_q(t * q_stride + head * HEAD_SIZE + idx);
-        shared_v[idx] = load_v(t * kv_stride + kv_head * HEAD_SIZE + idx);
+        // Load K[head_dim] into shared_k (32 threads, each loads 4 f32 values).
+        let k_vec4 = load_k_vec4(t * kv_stride + kv_head * HEAD_SIZE + idx);
+        shared_k[idx * 4u + 0u] = k_vec4.x;
+        shared_k[idx * 4u + 1u] = k_vec4.y;
+        shared_k[idx * 4u + 2u] = k_vec4.z;
+        shared_k[idx * 4u + 3u] = k_vec4.w;
+
+        // Load Q[head_dim] for each Q head in the GQA group.
+        for (var qg = 0u; qg < GROUP_RATIO; qg++) {
+            let q_head = kv_head * GROUP_RATIO + qg;
+            let q_vec4 = load_q_vec4(t * q_stride + q_head * HEAD_SIZE + idx);
+            let qbase = qg * HEAD_DIM + idx * 4u;
+            shared_q[qbase + 0u] = q_vec4.x;
+            shared_q[qbase + 1u] = q_vec4.y;
+            shared_q[qbase + 2u] = q_vec4.z;
+            shared_q[qbase + 3u] = q_vec4.w;
+        }
         workgroupBarrier();
 
-        // Gate: one scalar per Q head per token.
-        let decay = exp(load_gate(t, head));
+        // Gate: one scalar per KV head per token.
+        let gate_val = load_gate(t, kv_head);
+        let decay = 1.0 / (1.0 + exp(-gate_val));
 
-        // K for our column position from the KV head.
-        let k_vec = load_k(t * kv_stride + kv_head * HEAD_SIZE + idx);
+        // V column for this thread (vec4 of head_dim dimension).
+        let v_col = load_v_vec4(t * kv_stride + kv_head * HEAD_SIZE + idx);
 
-        var y = vec4<f32>(0.0);
+        // Output accumulators per Q head.
+        var y0 = vec4<f32>(0.0);
+        var y1 = vec4<f32>(0.0);
+        var y2 = vec4<f32>(0.0);
+        var y3 = vec4<f32>(0.0);
+        var y4 = vec4<f32>(0.0);
+        var y5 = vec4<f32>(0.0);
+        var y6 = vec4<f32>(0.0);
+        var y7 = vec4<f32>(0.0);
+        var y8 = vec4<f32>(0.0);
+        var y9 = vec4<f32>(0.0);
+        var y10 = vec4<f32>(0.0);
+        var y11 = vec4<f32>(0.0);
 
-        // Iterate over rows of S in groups of 4 (matching vec4 of V and Q).
-        for (var j = 0u; j < HEAD_SIZE; j++) {
-            let v_scalar = shared_v[j];
-            let q_scalar = shared_q[j];
+        // Normalizer accumulators (thread 0 only).
+        var l0 = 0.0; var l1 = 0.0; var l2 = 0.0; var l3 = 0.0;
+        var l4 = 0.0; var l5 = 0.0; var l6 = 0.0; var l7 = 0.0;
+        var l8 = 0.0; var l9 = 0.0; var l10 = 0.0; var l11 = 0.0;
 
-            // State indices for 4 consecutive rows.
-            let si0 = compute_index(cursor.batch, j * 4u + 0u, head * HEAD_SIZE + idx);
-            let si1 = compute_index(cursor.batch, j * 4u + 1u, head * HEAD_SIZE + idx);
-            let si2 = compute_index(cursor.batch, j * 4u + 2u, head * HEAD_SIZE + idx);
-            let si3 = compute_index(cursor.batch, j * 4u + 3u, head * HEAD_SIZE + idx);
+        let sok_base = cursor.batch * sok_stride + kv_head * EXPANDED_DIM;
 
-            var s0 = state[si0];
-            var s1 = state[si1];
-            var s2 = state[si2];
-            var s3 = state[si3];
+        // Iterate over block-pairs in the upper triangle.
+        // y_K: inner block index (0..7), x_K: outer block index (0..2*(y_K+1)-1).
+        // Each block-pair produces 8*16=128 D-rows.
+        var d = 0u;
+        for (var y_K = 0u; y_K < 8u; y_K++) {
+            let max_x = 2u * (y_K + 1u);
+            for (var x_K = 0u; x_K < max_x; x_K++) {
+                // Multiplier: 2 for off-diagonal (x_K < 2*y_K), 1 for diagonal.
+                let mult = select(1.0, 2.0, x_K < 2u * y_K);
 
-            // State update: S[row][col] = decay * S[row][col] + V[row] * K[col]
-            s0 = decay * s0 + v_scalar[0] * k_vec;
-            s1 = decay * s1 + v_scalar[1] * k_vec;
-            s2 = decay * s2 + v_scalar[2] * k_vec;
-            s3 = decay * s3 + v_scalar[3] * k_vec;
+                for (var o = 0u; o < 8u; o++) {
+                    let a = x_K * 8u + o;
 
-            state[si0] = s0;
-            state[si1] = s1;
-            state[si2] = s2;
-            state[si3] = s3;
+                    for (var i = 0u; i < 16u; i++) {
+                        let b = y_K * 16u + i;
 
-            // Output: Y[col] += S[row][col] * Q[row]
-            y += s0 * q_scalar[0];
-            y += s1 * q_scalar[1];
-            y += s2 * q_scalar[2];
-            y += s3 * q_scalar[3];
+                        // Feature map values.
+                        let phi_k = mult * shared_k[a] * shared_k[b];
+
+                        // State update: S[d, col] = decay * S[d, col] + phi_k * V[col]
+                        let si = compute_index(cursor.batch, d, kv_head * HEAD_SIZE + idx);
+                        var s_val = state[si];
+                        s_val = decay * s_val + phi_k * v_col;
+                        state[si] = s_val;
+
+                        // Output accumulation per Q head.
+                        // phi_Q[d] = Q[a] * Q[b] (no multiplier for Q).
+                        var pq0 = shared_q[0u * HEAD_DIM + a] * shared_q[0u * HEAD_DIM + b];
+                        y0 += s_val * pq0;
+                        var pq1 = shared_q[1u * HEAD_DIM + a] * shared_q[1u * HEAD_DIM + b];
+                        y1 += s_val * pq1;
+                        var pq2 = shared_q[2u * HEAD_DIM + a] * shared_q[2u * HEAD_DIM + b];
+                        y2 += s_val * pq2;
+                        var pq3 = shared_q[3u * HEAD_DIM + a] * shared_q[3u * HEAD_DIM + b];
+                        y3 += s_val * pq3;
+                        var pq4 = shared_q[4u * HEAD_DIM + a] * shared_q[4u * HEAD_DIM + b];
+                        y4 += s_val * pq4;
+                        var pq5 = shared_q[5u * HEAD_DIM + a] * shared_q[5u * HEAD_DIM + b];
+                        y5 += s_val * pq5;
+                        var pq6 = shared_q[6u * HEAD_DIM + a] * shared_q[6u * HEAD_DIM + b];
+                        y6 += s_val * pq6;
+                        var pq7 = shared_q[7u * HEAD_DIM + a] * shared_q[7u * HEAD_DIM + b];
+                        y7 += s_val * pq7;
+                        var pq8 = shared_q[8u * HEAD_DIM + a] * shared_q[8u * HEAD_DIM + b];
+                        y8 += s_val * pq8;
+                        var pq9 = shared_q[9u * HEAD_DIM + a] * shared_q[9u * HEAD_DIM + b];
+                        y9 += s_val * pq9;
+                        var pq10 = shared_q[10u * HEAD_DIM + a] * shared_q[10u * HEAD_DIM + b];
+                        y10 += s_val * pq10;
+                        var pq11 = shared_q[11u * HEAD_DIM + a] * shared_q[11u * HEAD_DIM + b];
+                        y11 += s_val * pq11;
+
+                        // Sum-of-keys update and normalizer accumulation (thread 0 only).
+                        if (idx == 0u) {
+                            let sok_idx = sok_base + d;
+                            var sok = sum_of_keys[sok_idx];
+                            sok = decay * sok + phi_k;
+                            sum_of_keys[sok_idx] = sok;
+
+                            l0 += sok * pq0;
+                            l1 += sok * pq1;
+                            l2 += sok * pq2;
+                            l3 += sok * pq3;
+                            l4 += sok * pq4;
+                            l5 += sok * pq5;
+                            l6 += sok * pq6;
+                            l7 += sok * pq7;
+                            l8 += sok * pq8;
+                            l9 += sok * pq9;
+                            l10 += sok * pq10;
+                            l11 += sok * pq11;
+                        }
+
+                        d++;
+                    }
+                }
+            }
         }
 
-        store_output(t * q_stride + head * HEAD_SIZE + idx, y);
+        // Thread 0 writes normalizers to shared memory.
+        if (idx == 0u) {
+            shared_l[0] = l0; shared_l[1] = l1; shared_l[2] = l2; shared_l[3] = l3;
+            shared_l[4] = l4; shared_l[5] = l5; shared_l[6] = l6; shared_l[7] = l7;
+            shared_l[8] = l8; shared_l[9] = l9; shared_l[10] = l10; shared_l[11] = l11;
+        }
+        workgroupBarrier();
+
+        // Store normalized output for each Q head.
+        let inv_l0 = 1.0 / shared_l[0];
+        let inv_l1 = 1.0 / shared_l[1];
+        let inv_l2 = 1.0 / shared_l[2];
+        let inv_l3 = 1.0 / shared_l[3];
+        let inv_l4 = 1.0 / shared_l[4];
+        let inv_l5 = 1.0 / shared_l[5];
+        let inv_l6 = 1.0 / shared_l[6];
+        let inv_l7 = 1.0 / shared_l[7];
+        let inv_l8 = 1.0 / shared_l[8];
+        let inv_l9 = 1.0 / shared_l[9];
+        let inv_l10 = 1.0 / shared_l[10];
+        let inv_l11 = 1.0 / shared_l[11];
+
+        let q_base = kv_head * GROUP_RATIO;
+        store_output(t * q_stride + (q_base + 0u) * HEAD_SIZE + idx, y0 * inv_l0);
+        store_output(t * q_stride + (q_base + 1u) * HEAD_SIZE + idx, y1 * inv_l1);
+        store_output(t * q_stride + (q_base + 2u) * HEAD_SIZE + idx, y2 * inv_l2);
+        store_output(t * q_stride + (q_base + 3u) * HEAD_SIZE + idx, y3 * inv_l3);
+        store_output(t * q_stride + (q_base + 4u) * HEAD_SIZE + idx, y4 * inv_l4);
+        store_output(t * q_stride + (q_base + 5u) * HEAD_SIZE + idx, y5 * inv_l5);
+        store_output(t * q_stride + (q_base + 6u) * HEAD_SIZE + idx, y6 * inv_l6);
+        store_output(t * q_stride + (q_base + 7u) * HEAD_SIZE + idx, y7 * inv_l7);
+        store_output(t * q_stride + (q_base + 8u) * HEAD_SIZE + idx, y8 * inv_l8);
+        store_output(t * q_stride + (q_base + 9u) * HEAD_SIZE + idx, y9 * inv_l9);
+        store_output(t * q_stride + (q_base + 10u) * HEAD_SIZE + idx, y10 * inv_l10);
+        store_output(t * q_stride + (q_base + 11u) * HEAD_SIZE + idx, y11 * inv_l11);
         workgroupBarrier();
     }
 }

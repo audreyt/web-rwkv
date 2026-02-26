@@ -851,7 +851,7 @@ impl TensorOp {
         Ok(Self::Atom {
             pipeline,
             bindings,
-            dispatch: [matrix.shape[1] as u32 / 4, shape[1] as u32, shape[2] as u32],
+            dispatch: [u32::div_ceil(matrix.shape[1] as u32, 4), shape[1] as u32, shape[2] as u32],
         })
     }
 
@@ -953,7 +953,7 @@ impl TensorOp {
         Ok(Self::Atom {
             pipeline,
             bindings,
-            dispatch: [matrix.shape[1] as u32 / 4, shape[1] as u32, shape[2] as u32],
+            dispatch: [u32::div_ceil(matrix.shape[1] as u32, 4), shape[1] as u32, shape[2] as u32],
         })
     }
 
@@ -1058,7 +1058,7 @@ impl TensorOp {
         Ok(Self::Atom {
             pipeline,
             bindings,
-            dispatch: [matrix.shape[1] as u32 / 4, shape[1] as u32, shape[2] as u32],
+            dispatch: [u32::div_ceil(matrix.shape[1] as u32, 4), shape[1] as u32, shape[2] as u32],
         })
     }
 
@@ -1354,7 +1354,7 @@ impl TensorOp {
             pipeline,
             bindings,
             dispatch: [
-                u32::div_ceil(shape[0] as u32 / 4, BLOCK_SIZE),
+                u32::div_ceil(u32::div_ceil(shape[0] as u32, 4), BLOCK_SIZE),
                 shape[1] as u32,
                 shape[2] as u32,
             ],
@@ -1439,7 +1439,7 @@ impl TensorOp {
             pipeline,
             bindings,
             dispatch: [
-                u32::div_ceil(shape[0] as u32 / 4, BLOCK_SIZE),
+                u32::div_ceil(u32::div_ceil(shape[0] as u32, 4), BLOCK_SIZE),
                 shape[1] as u32,
                 shape[2] as u32,
             ],
@@ -1596,6 +1596,7 @@ impl TensorOp {
     pub fn power_retention<'a, T: Float>(
         cursors: &TensorGpu<u32, ReadWrite>,
         state: impl Into<TensorGpuView<'a, f32>>,
+        sum_of_keys: &TensorGpu<f32, ReadWrite>,
         gate: &TensorGpu<T, ReadWrite>,
         q: &TensorGpu<T, ReadWrite>,
         k: &TensorGpu<T, ReadWrite>,
@@ -1605,6 +1606,7 @@ impl TensorOp {
         num_heads: u32,
         num_kv_heads: u32,
         num_gate_heads: u32,
+        expanded_dim: u32,
     ) -> Result<Self, TensorError> {
         let head_size = head_dim / 4;
         let block_size = head_size;
@@ -1615,22 +1617,31 @@ impl TensorOp {
 
         let q_dim = (num_heads * head_dim) as usize;
         let kv_dim = (num_kv_heads * head_dim) as usize;
+        let group_ratio = num_heads / num_kv_heads;
+
         q.check_shape([q_dim, shape[1], 1, 1])?;
         k.check_shape([kv_dim, shape[1], 1, 1])?;
         v.check_shape([kv_dim, shape[1], 1, 1])?;
         output.check_shape([q_dim, shape[1], 1, 1])?;
-        state.check_shape([q_dim, head_dim as usize, state.shape()[2], 1])?;
+        state.check_shape([kv_dim, expanded_dim as usize, state.shape()[2], 1])?;
         cursors.check_shape([shape[1], 1, 1, 1])?;
 
+        let gate_stride = gate.shape()[0] as u32;
+        let num_block_pairs = expanded_dim / (8 * 16); // OuterBlock * InnerBlock = 128
         let key = PipelineKey::new(
             "power_retention",
             "power_retention",
             Macros::new()
                 .u32("BLOCK_SIZE", block_size)
                 .u32("HEAD_SIZE", head_size)
+                .u32("HEAD_DIM", head_dim)
                 .u32("NUM_HEADS", num_heads)
                 .u32("NUM_KV_HEADS", num_kv_heads)
                 .u32("NUM_GATE_HEADS", num_gate_heads)
+                .u32("GATE_STRIDE", gate_stride)
+                .u32("GROUP_RATIO", group_ratio)
+                .u32("EXPANDED_DIM", expanded_dim)
+                .u32("NUM_BLOCK_PAIRS", num_block_pairs)
                 .tensor(q, None),
         );
         let pipeline = context.checkout_pipeline(
@@ -1646,6 +1657,7 @@ impl TensorOp {
                 k.layout(6, true),
                 v.layout(7, true),
                 output.layout(8, false),
+                sum_of_keys.layout(9, false),
             ],
         );
 
@@ -1659,12 +1671,13 @@ impl TensorOp {
             .bind(6, k)
             .bind(7, v)
             .bind(8, output)
+            .bind(9, sum_of_keys)
             .build()];
 
         Ok(Self::Atom {
             pipeline,
             bindings,
-            dispatch: [num_heads, 1, 1],
+            dispatch: [num_kv_heads, 1, 1],
         })
     }
 

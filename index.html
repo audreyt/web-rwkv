@@ -1109,8 +1109,13 @@ async function loadShardStreaming(url, builder, onBytesReceived) {
     const tensorData = sr.take(tensorSize);
     dataPos = t.end;
 
-    // Upload to GPU via WASM
+    // Upload to GPU via WASM.
+    // add_tensor() is synchronous WASM — it does BF16→F16 conversion and
+    // GPUQueue.writeBuffer() which can block the event loop for 100s of ms
+    // on large weight matrices.  Yielding here lets the browser drain the
+    // TCP receive buffer so the streaming fetch connection stays alive.
     builder.add_tensor(t.name, new Uint32Array(t.shape), t.dtype, tensorData);
+    await new Promise(r => setTimeout(r, 0)); // yield to event loop
     tensorCount++;
 
     if (onBytesReceived) onBytesReceived(sr.totalReceived);
@@ -1198,6 +1203,33 @@ async function loadModel() {
     modelLoaded = true;
     dom.loadStatus.textContent = 'Model ready';
     log(`Model built: ${runtime.version}, ${runtime.num_layer} layers, d=${runtime.num_emb}, vocab=${runtime.num_vocab}`, 'ok');
+
+    // Debug: log model detection info
+    try {
+      const info = JSON.parse(runtime.debug_info());
+      console.log('[debug_info]', info);
+      log(`Model info: head=${info.num_head}, kv_head=${info.num_kv_head}, head_dim=${info.head_dim}, intermediate=${info.intermediate_size}, qk_norm=${info.has_qk_norm}, gated_ffn=${info.gated_ffn}, act=${info.hidden_act}, rope_theta=${info.rope_theta}`, 'ok');
+    } catch (e) {
+      log(`debug_info: ${e.message}`, 'warn');
+    }
+
+    // Debug: sample embed and norm values to verify data integrity
+    try {
+      const emb0 = runtime.debug_embed(0, 8);
+      console.log('[debug_embed token=0]', Array.from(emb0).map(v => v.toFixed(6)));
+      const emb1 = runtime.debug_embed(1, 8);
+      console.log('[debug_embed token=1]', Array.from(emb1).map(v => v.toFixed(6)));
+      log(`Embed[0][0:8]: ${Array.from(emb0).map(v => v.toFixed(4)).join(', ')}`, 'ok');
+
+      const norm0 = await runtime.debug_norm_weight(0, 8);
+      console.log('[debug_norm layer=0]', Array.from(norm0).map(v => v.toFixed(6)));
+      const normH = await runtime.debug_norm_weight(-1, 8);
+      console.log('[debug_norm head]', Array.from(normH).map(v => v.toFixed(6)));
+      log(`Norm[0][0:8]: ${Array.from(norm0).map(v => v.toFixed(4)).join(', ')}`, 'ok');
+    } catch (e) {
+      log(`debug tensors: ${e.message}`, 'warn');
+      if (e.stack) console.error(e.stack);
+    }
   } catch (e) {
     log(`Model build: ${e.message}`, 'err');
     if (e.stack) log(`Stack: ${e.stack}`, 'err');
@@ -1320,6 +1352,26 @@ async function generate() {
       dom.statPrefill.innerHTML = `${prefillTps.toFixed(1)} <span class="stat-unit">tok/s</span>`;
       log(`Prefill: ${tokens.length} tokens in ${prefillMs.toFixed(0)}ms (${prefillTps.toFixed(1)} tok/s)`, 'ok');
 
+      // Debug: log logit stats
+      function logitStats(arr, label) {
+        let min = Infinity, max = -Infinity, sum = 0, nanCount = 0, infCount = 0;
+        let argmax = 0;
+        for (let i = 0; i < arr.length; i++) {
+          const v = arr[i];
+          if (isNaN(v)) { nanCount++; continue; }
+          if (!isFinite(v)) { infCount++; continue; }
+          if (v < min) min = v;
+          if (v > max) { max = v; argmax = i; }
+          sum += v;
+        }
+        const mean = sum / (arr.length - nanCount - infCount);
+        // Top-5 tokens
+        const indexed = Array.from(arr).map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]);
+        const top5 = indexed.slice(0, 5).map(([v, i]) => `${i}(${v.toFixed(2)})`).join(' ');
+        console.log(`[${label}] len=${arr.length} min=${min.toFixed(4)} max=${max.toFixed(4)} mean=${mean.toFixed(4)} nan=${nanCount} inf=${infCount} argmax=${argmax} top5=[${top5}]`);
+      }
+      logitStats(new Float32Array(logits), 'prefill');
+
       genStart = performance.now();
 
       // Generate tokens one by one
@@ -1341,6 +1393,7 @@ async function generate() {
 
         // Feed token back for next step
         logits = await inferStep(new Uint32Array([token]));
+        if (i < 20) logitStats(new Float32Array(logits), `gen-${i} tok=${token}`);
 
         // Yield to UI
         await new Promise(r => setTimeout(r, 0));
