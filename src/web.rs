@@ -11,7 +11,7 @@ use crate::{
         brumby::{self, Att, Embed, Ffn, Head, Layer, Model, ModelTensor, RmsNorm},
         infer::{Rnn, RnnInput, RnnInputBatch, RnnOption, Token},
         loader::{Loader, Reader, ReaderTensor, TensorFromReader as _, PAD_MAT},
-        model::{Bundle as _, ContextAutoLimits as _, ModelBuilder, ModelCustomInfo, ModelInfo, Quant, State as _},
+        model::{AsAny, Bundle as _, ContextAutoLimits as _, ModelBuilder, ModelCustomInfo, ModelInfo, Quant, State as _},
         softmax, SimpleRuntime,
     },
     tensor::{kind::ReadWrite, matrix::Matrix, TensorCpu, TensorGpu, TensorInit as _, TensorInto as _, TensorShape as _},
@@ -433,16 +433,23 @@ impl WasmSessionBuilder {
             return Ok(());
         }
 
+        // Minimum padding to ensure matmul dispatch sizes are non-zero.
+        // matmul_vec processes 4 output elements per workgroup, so output dim must be >= 4.
+        const PAD_VEC: [usize; 4] = [4, 1, 1, 1];
+        const PAD_WEIGHT: [usize; 4] = [4, 4, 1, 1];
+
         if is_1d {
-            // Vector (norm weight / bias): upload as f16.
+            // Vector (norm weight / bias): upload as f16, padded to multiple of 4.
             let gpu = TensorCpu::<f16>::from_reader(reader_tensor)
                 .map_err(|e| JsError::new(&format!("Tensor error ({name}): {e}")))?
+                .pad(PAD_VEC)
                 .to(context);
             self.gpu_vectors.insert(name.to_string(), gpu);
         } else {
-            // Weight matrix: upload as f16, optionally quantize.
+            // Weight matrix: upload as f16 (padded to multiple of 4), optionally quantize.
             let gpu: TensorGpu<f16, ReadWrite> = TensorCpu::<f16>::from_reader(reader_tensor)
                 .map_err(|e| JsError::new(&format!("Tensor error ({name}): {e}")))?
+                .pad(PAD_WEIGHT)
                 .to(context);
 
             let layer_idx = Self::extract_layer_index(name);
@@ -640,11 +647,16 @@ impl WasmSession {
     /// Reset the model state to zeros (for starting a new conversation).
     pub fn reset_state(&self) -> Result<(), JsError> {
         let bundle = self.runtime.bundle();
+        // Reset RoPE position counter so new conversation starts at position 0.
+        bundle.rope_position.store(0, std::sync::atomic::Ordering::Relaxed);
         let state = bundle.state();
         let init = state.init();
         state
             .load(init, 0)
             .map_err(|e| JsError::new(&format!("State reset error: {e}")))?;
+        // Reset sum-of-keys accumulators (deg=2 power retention).
+        let state = state.as_any().downcast_ref::<crate::runtime::brumby::State>().unwrap();
+        state.reset_sum_of_keys();
         Ok(())
     }
 
@@ -677,4 +689,58 @@ impl WasmSession {
     pub fn num_head(&self) -> usize {
         self.info.num_head
     }
+
+    /// Return the first `count` f32 values of the embed vector for `token_id`.
+    /// Useful for verifying that the embed tensor data is intact.
+    pub fn debug_embed(&self, token_id: u32, count: u32) -> Vec<f32> {
+        let bundle = self.runtime.bundle();
+        let embed = &bundle.model.tensor.embed.w;
+        let num_emb = embed.shape()[0];
+        let data = embed.data();
+        let start = num_emb * token_id as usize;
+        let end = (start + count as usize).min(start + num_emb).min(data.len());
+        data[start..end].iter().map(|v| v.to_f32()).collect()
+    }
+
+    /// Read back the first `count` f32 values from a GPU norm weight.
+    /// layer=-1 means head norm ("model.norm"), otherwise the input_ln of that layer.
+    pub async fn debug_norm_weight(&self, layer: i32, count: u32) -> Result<Vec<f32>, JsError> {
+        let bundle = self.runtime.bundle();
+        let tensor = if layer < 0 {
+            &bundle.model.tensor.head.ln.w
+        } else {
+            let idx = layer as usize;
+            if idx >= bundle.model.tensor.layers.len() {
+                return Err(JsError::new("layer index out of bounds"));
+            }
+            &bundle.model.tensor.layers[idx].input_ln.w
+        };
+        let cpu = tensor.clone().back().await;
+        let n = (count as usize).min(cpu.data().len());
+        Ok(cpu.data()[..n].iter().map(|v| v.to_f32()).collect())
+    }
+
+    /// Return a JSON string with full model info including custom (Brumby/PowerCoder) fields.
+    pub fn debug_info(&self) -> String {
+        let ModelCustomInfo::Brumby(custom) = self.info.custom else {
+            return format!("{{\"error\": \"not Brumby\"}}");
+        };
+        format!(
+            r#"{{"version":"{:?}","num_layer":{},"num_emb":{},"num_hidden":{},"num_vocab":{},"num_head":{},"num_kv_head":{},"head_dim":{},"intermediate_size":{},"has_qk_norm":{},"gated_ffn":{},"hidden_act":"{:?}","rope_theta":{}}}"#,
+            self.info.version,
+            self.info.num_layer,
+            self.info.num_emb,
+            self.info.num_hidden,
+            self.info.num_vocab,
+            self.info.num_head,
+            custom.num_kv_head,
+            custom.head_dim,
+            custom.intermediate_size,
+            custom.has_qk_norm,
+            custom.gated_ffn,
+            custom.hidden_act,
+            custom.rope_theta(),
+        )
+    }
+
 }

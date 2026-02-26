@@ -492,6 +492,7 @@ impl<R: Reader> Loader<R> {
                 gated_ffn: true,
                 hidden_act: Activation::Silu,
                 rope_theta_bits: 0,
+                power_deg: 1,
             }
             .with_rope_theta(1_000_000.0),
         );
@@ -549,6 +550,7 @@ impl<R: Reader> Loader<R> {
                 gated_ffn: false,
                 hidden_act: Activation::Gelu,
                 rope_theta_bits: 0,
+                power_deg: 2,
             }
             .with_rope_theta(10_000.0),
         );
