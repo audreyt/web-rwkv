@@ -115,6 +115,52 @@ fn rms_norm(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     }
 }
 
+#ifdef GROUP_SIZE
+/// Group RMS norm: normalize groups of GROUP_SIZE elements independently.
+/// Used for per-head Q/K norms in Brumby (where w has shape [head_dim]).
+/// Dispatch: [num_groups, num_token, num_batch].
+@compute @workgroup_size(BLOCK_SIZE, 1, 1)
+fn group_rms_norm(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) group_id: vec3<u32>,
+) {
+    let group_stride = GROUP_SIZE / 4u;
+    let full_stride = shape[0] / 4u;
+    let index = local_id.x;
+    let group = group_id.x;
+    let token = group_id.y;
+    let batch = group_id.z;
+
+    let bb = (batch * shape[1] + token) * full_stride + group * group_stride;
+
+    var _sum_4: vec4<f32>;
+    for (var i = index; i < group_stride; i += BLOCK_SIZE) {
+        let value = load_x(bb + i);
+        _sum_4 += value * value;
+    }
+    sketch[index] = _sum_4;
+    workgroupBarrier();
+
+    reduce_sum(index, 64u);
+    reduce_sum(index, 32u);
+    reduce_sum(index, 16u);
+    reduce_sum(index, 8u);
+    reduce_sum(index, 4u);
+    reduce_sum(index, 2u);
+    reduce_sum(index, 1u);
+
+    if index == 0u {
+        norm = inverseSqrt(dot(sketch[0], vec4<f32>(1.0)) / f32(GROUP_SIZE) + EPS);
+    }
+    workgroupBarrier();
+
+    for (var i = index; i < group_stride; i += BLOCK_SIZE) {
+        let value = load_x(bb + i) * norm;
+        store_x(bb + i, fma(value, unpack4x16float(w[i]), unpack4x16float(b[i])));
+    }
+}
+#endif
+
 @compute @workgroup_size(BLOCK_SIZE, 1, 1)
 fn l2_norm(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     let stride = shape[0] / 4u;

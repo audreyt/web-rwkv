@@ -1,0 +1,1523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PowerCoder-3B — Browser Inference</title>
+<style>
+/* ── Reset & Foundational ── */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+@font-face {
+  font-family: 'BerkeleyMono';
+  src: local('Berkeley Mono'), local('BerkeleyMono-Regular');
+}
+
+:root {
+  --bg:        #0c0c0e;
+  --surface:   #131316;
+  --surface-2: #1a1a1f;
+  --border:    #252529;
+  --border-hi: #35353b;
+  --fg:        #c8c8d0;
+  --fg-dim:    #6e6e7a;
+  --fg-muted:  #44444f;
+  --accent:    #4ade80;
+  --accent-dim:#2a7a48;
+  --warn:      #f59e0b;
+  --err:       #ef4444;
+  --blue:      #60a5fa;
+  --purple:    #a78bfa;
+  --mono: 'BerkeleyMono', 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', 'Menlo', monospace;
+  --sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --gutter-w: 3.5rem;
+}
+
+html { font-size: 14px; }
+body {
+  font-family: var(--mono);
+  background: var(--bg);
+  color: var(--fg);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scanline overlay ── */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.03) 2px,
+    rgba(0,0,0,0.03) 4px
+  );
+  z-index: 9999;
+}
+
+/* ── Header ── */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0 1rem;
+  height: 2.75rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.header-logo {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.header-logo .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 6px var(--accent); }
+  50% { opacity: 0.5; box-shadow: 0 0 2px var(--accent); }
+}
+
+.header-sep {
+  width: 1px;
+  height: 1rem;
+  background: var(--border);
+}
+
+.header-model {
+  font-size: 0.75rem;
+  color: var(--fg-dim);
+}
+
+.header-model b {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.header-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.gpu-badge {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.2rem 0.5rem;
+  border-radius: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+}
+
+.gpu-badge.ok { border-color: var(--accent-dim); color: var(--accent); }
+
+/* ── Main Layout ── */
+.main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+/* ── Sidebar ── */
+.sidebar {
+  width: 15rem;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+
+.sidebar-section {
+  padding: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-label {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--fg-muted);
+  margin-bottom: 0.75rem;
+}
+
+/* ── Controls ── */
+.ctrl-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.6rem;
+}
+
+.ctrl-row:last-child { margin-bottom: 0; }
+
+.ctrl-name {
+  font-size: 0.75rem;
+  color: var(--fg-dim);
+}
+
+.ctrl-val {
+  font-size: 0.75rem;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+  min-width: 2.5rem;
+  text-align: right;
+}
+
+input[type=range] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+  margin-top: 0.35rem;
+}
+
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: none;
+}
+
+input[type=range]::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: none;
+}
+
+/* ── Buttons ── */
+.btn {
+  width: 100%;
+  padding: 0.55rem 0;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--fg);
+  cursor: pointer;
+  transition: all 0.15s;
+  text-transform: uppercase;
+}
+
+.btn:hover { border-color: var(--border-hi); background: var(--border); }
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.btn-primary:hover { background: #3fcc72; }
+.btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-stop {
+  background: transparent;
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.btn-stop:hover { background: rgba(239,68,68,0.1); }
+
+/* ── Model Load Section ── */
+.model-load {
+  padding: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.load-progress {
+  width: 100%;
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  margin-top: 0.5rem;
+  overflow: hidden;
+  display: none;
+}
+
+.load-progress.active { display: block; }
+
+.load-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s;
+  box-shadow: 0 0 8px rgba(74,222,128,0.3);
+}
+
+.load-status {
+  font-size: 0.65rem;
+  color: var(--fg-dim);
+  margin-top: 0.4rem;
+  min-height: 1.1em;
+  line-height: 1.1;
+}
+
+/* ── Stats Section ── */
+.stats-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+
+.stat-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem;
+}
+
+.stat-label {
+  font-size: 0.55rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--fg-muted);
+}
+
+.stat-value {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--fg);
+  margin-top: 0.15rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-value.accent { color: var(--accent); }
+.stat-unit {
+  font-size: 0.55rem;
+  color: var(--fg-dim);
+  font-weight: 400;
+}
+
+/* ── Editor ── */
+.editor-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.editor-tabs {
+  display: flex;
+  height: 2.25rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 1rem;
+  font-size: 0.72rem;
+  color: var(--fg-dim);
+  border-right: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s;
+}
+
+.tab:hover { color: var(--fg); }
+.tab.active {
+  color: var(--fg);
+  background: var(--bg);
+  border-bottom: 1px solid var(--accent);
+  margin-bottom: -1px;
+}
+
+.tab .icon { font-size: 0.85rem; }
+
+/* ── Code Panels ── */
+.panels {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  position: relative;
+}
+
+.panel + .panel { border-left: 1px solid var(--border); }
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1rem;
+  height: 1.75rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.panel-title {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--fg-muted);
+}
+
+.panel-badge {
+  font-size: 0.6rem;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.code-wrap {
+  flex: 1;
+  display: flex;
+  overflow: auto;
+  min-height: 0;
+}
+
+.gutter {
+  width: var(--gutter-w);
+  flex-shrink: 0;
+  background: var(--surface);
+  text-align: right;
+  padding-right: 0.75rem;
+  padding-top: 0.75rem;
+  font-size: 0.75rem;
+  line-height: 1.65;
+  color: var(--fg-muted);
+  user-select: none;
+  border-right: 1px solid var(--border);
+}
+
+.code-input,
+.code-output {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  line-height: 1.65;
+  color: var(--fg);
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: none;
+  white-space: pre-wrap;
+  word-break: break-all;
+  tab-size: 4;
+  -moz-tab-size: 4;
+  overflow: auto;
+}
+
+.code-input::placeholder { color: var(--fg-muted); }
+
+.code-output {
+  overflow-y: auto;
+}
+
+.code-output .generated {
+  color: var(--accent);
+}
+
+.code-output .cursor-blink {
+  display: inline-block;
+  width: 0.5em;
+  height: 1.1em;
+  background: var(--accent);
+  vertical-align: text-bottom;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* ── Status Bar ── */
+.statusbar {
+  display: flex;
+  align-items: center;
+  height: 1.5rem;
+  padding: 0 0.75rem;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font-size: 0.65rem;
+  color: var(--fg-dim);
+  flex-shrink: 0;
+  gap: 1rem;
+  user-select: none;
+}
+
+.statusbar .sep { width: 1px; height: 0.6rem; background: var(--border); }
+
+.status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--fg-muted);
+  flex-shrink: 0;
+}
+
+.status-dot.ready { background: var(--accent); box-shadow: 0 0 4px var(--accent); }
+.status-dot.loading { background: var(--warn); animation: pulse 1s infinite; }
+.status-dot.error { background: var(--err); }
+
+.statusbar-right { margin-left: auto; display: flex; align-items: center; gap: 1rem; }
+
+/* ── Overlay: No WebGPU ── */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(12,12,14,0.95);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.overlay-card {
+  max-width: 28rem;
+  padding: 2.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  text-align: center;
+}
+
+.overlay-icon {
+  font-size: 2.5rem;
+  margin-bottom: 1rem;
+}
+
+.overlay-title {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
+.overlay-text {
+  font-size: 0.75rem;
+  color: var(--fg-dim);
+  line-height: 1.6;
+}
+
+.overlay-text a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.overlay-text a:hover { text-decoration: underline; }
+
+.overlay-text code {
+  background: var(--bg);
+  padding: 0.15em 0.4em;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+
+.hidden { display: none !important; }
+
+/* ── Log area ── */
+.log-panel {
+  height: 8rem;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.log-header {
+  display: flex;
+  align-items: center;
+  padding: 0 1rem;
+  height: 1.75rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.log-header span {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--fg-muted);
+}
+
+.log-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.5rem 1rem;
+  font-size: 0.7rem;
+  line-height: 1.5;
+  color: var(--fg-dim);
+}
+
+.log-content .log-info { color: var(--blue); }
+.log-content .log-ok   { color: var(--accent); }
+.log-content .log-warn { color: var(--warn); }
+.log-content .log-err  { color: var(--err); }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-hi); }
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  .sidebar { display: none; }
+  .panels { flex-direction: column; }
+  .panel + .panel { border-left: none; border-top: 1px solid var(--border); }
+}
+</style>
+</head>
+<body>
+
+<!-- ── No WebGPU Overlay ── -->
+<div class="overlay hidden" id="noGpuOverlay">
+  <div class="overlay-card">
+    <div class="overlay-icon">&#x26A0;</div>
+    <div class="overlay-title">WebGPU Not Available</div>
+    <div class="overlay-text">
+      PowerCoder-3B requires <b>WebGPU</b> for in-browser inference.<br><br>
+      Use <b>Chrome 113+</b> or <b>Edge 113+</b> on desktop.<br>
+      On macOS, <b>Safari 18+</b> also works.<br><br>
+      Check <a href="https://webgpureport.org" target="_blank">webgpureport.org</a> to verify your browser.
+    </div>
+  </div>
+</div>
+
+<!-- ── Header ── -->
+<header class="header">
+  <div class="header-logo">
+    <span class="dot" id="headerDot"></span>
+    PowerCoder
+  </div>
+  <div class="header-sep"></div>
+  <div class="header-model"><b>PowerCoder-3B</b>&ensp;&#183;&ensp;Brumby runtime&ensp;&#183;&ensp;WebGPU</div>
+  <div class="header-right">
+    <div class="gpu-badge" id="gpuBadge">detecting gpu&hellip;</div>
+  </div>
+</header>
+
+<!-- ── Main ── -->
+<div class="main">
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+
+    <div class="model-load">
+      <div class="sidebar-label">Model</div>
+      <button class="btn btn-primary" id="btnLoad" disabled>Load Model</button>
+      <div class="load-progress" id="loadProgress">
+        <div class="load-bar" id="loadBar"></div>
+      </div>
+      <div class="load-status" id="loadStatus">&nbsp;</div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Generation</div>
+      <div class="ctrl-row">
+        <span class="ctrl-name">Max tokens</span>
+        <span class="ctrl-val" id="valTokens">256</span>
+      </div>
+      <input type="range" id="sliderTokens" min="16" max="1024" step="16" value="256">
+
+      <div class="ctrl-row" style="margin-top: 0.75rem">
+        <span class="ctrl-name">Temperature</span>
+        <span class="ctrl-val" id="valTemp">0.8</span>
+      </div>
+      <input type="range" id="sliderTemp" min="0" max="200" value="80">
+
+      <div class="ctrl-row" style="margin-top: 0.75rem">
+        <span class="ctrl-name">Top-P</span>
+        <span class="ctrl-val" id="valTopP">0.5</span>
+      </div>
+      <input type="range" id="sliderTopP" min="0" max="100" value="50">
+
+      <div class="ctrl-row" style="margin-top: 0.75rem">
+        <span class="ctrl-name">Presence penalty</span>
+        <span class="ctrl-val" id="valPres">0.3</span>
+      </div>
+      <input type="range" id="sliderPres" min="0" max="200" value="30">
+
+      <div class="ctrl-row" style="margin-top: 0.75rem">
+        <span class="ctrl-name">Count penalty</span>
+        <span class="ctrl-val" id="valCount">0.3</span>
+      </div>
+      <input type="range" id="sliderCount" min="0" max="200" value="30">
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Performance</div>
+      <div class="stats-grid">
+        <div class="stat-box">
+          <div class="stat-label">Prefill</div>
+          <div class="stat-value" id="statPrefill">&mdash; <span class="stat-unit">tok/s</span></div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-value accent" id="statGen">&mdash; <span class="stat-unit">tok/s</span></div>
+          <div class="stat-label">Decode</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Tokens</div>
+          <div class="stat-value" id="statTokenCount">0</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Time</div>
+          <div class="stat-value" id="statTime">&mdash; <span class="stat-unit">s</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sidebar-section" style="margin-top: auto; border-bottom: none;">
+      <button class="btn btn-primary" id="btnRun" disabled>Generate</button>
+      <div style="height: 0.5rem"></div>
+      <button class="btn btn-stop hidden" id="btnStop">Stop</button>
+    </div>
+  </aside>
+
+  <!-- ── Editor ── -->
+  <div class="editor-area">
+    <div class="editor-tabs">
+      <div class="tab active">
+        <span class="icon">&#x2738;</span> completion.py
+      </div>
+    </div>
+
+    <div class="panels">
+      <!-- Input Panel -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Prompt</span>
+          <span class="panel-badge" id="inputTokens">0 tokens</span>
+        </div>
+        <div class="code-wrap">
+          <div class="gutter" id="gutterIn">1</div>
+          <textarea
+            class="code-input"
+            id="codeInput"
+            spellcheck="false"
+            placeholder="Enter code or text to complete..."
+          >def fibonacci(n: int) -> list[int]:
+    """Return the first n Fibonacci numbers."""
+</textarea>
+        </div>
+      </div>
+
+      <!-- Output Panel -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Output</span>
+          <span class="panel-badge" id="outputTokens">0 tokens</span>
+        </div>
+        <div class="code-wrap">
+          <div class="gutter" id="gutterOut">1</div>
+          <div class="code-output" id="codeOutput"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Log Panel -->
+    <div class="log-panel">
+      <div class="log-header"><span>Console</span></div>
+      <div class="log-content" id="logContent"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Status Bar ── -->
+<footer class="statusbar">
+  <span class="status-dot" id="statusDot"></span>
+  <span id="statusText">Initializing&hellip;</span>
+  <span class="sep"></span>
+  <span id="statusModel">No model loaded</span>
+  <div class="statusbar-right">
+    <span id="statusGpu">&mdash;</span>
+    <span class="sep"></span>
+    <span>web-rwkv v0.10.19</span>
+  </div>
+</footer>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!--  PowerCoder-3B  •  WebGPU Inference Engine                -->
+<!--                                                           -->
+<!--  BUILD INSTRUCTIONS:                                      -->
+<!--  1. cd web-rwkv                                           -->
+<!--  2. wasm-pack build - -target web - -features web         -->
+<!--  3. Serve this file & the pkg/ directory over HTTP         -->
+<!--  4. Download model from HuggingFace:                      -->
+<!--     models/powercoder-3b/model.safetensors                -->
+<!--     models/powercoder-3b/tokenizer.json                   -->
+<!--                                                           -->
+<!--  The WASM module at ./pkg/web_rwkv.js exposes:            -->
+<!--  - BpeTokenizer(json: string) -> .encode() / .decode()    -->
+<!--  - WasmSession.create(data, chunk_size, quant_layers)     -->
+<!--    -> .infer(tokens) / .infer_raw(tokens)                 -->
+<!--    -> .reset_state() / .num_vocab / .version / etc.       -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<script type="module">
+// ── Configuration ──────────────────────────────────────────
+const WASM_MODULE_PATH = './pkg/web_rwkv.js';
+const MODEL_BASE_URL   = './models/powercoder-3b';
+const MODEL_INDEX_FILE = 'model.safetensors.index.json';
+const MODEL_FILES      = [
+  'model-00001-of-00003.safetensors',
+  'model-00002-of-00003.safetensors',
+  'model-00003-of-00003.safetensors',
+];
+const TOKENIZER_FILE   = 'tokenizer.json';
+
+// ── State ──────────────────────────────────────────────────
+let wasmModule   = null;
+let tokenizer    = null;
+let runtime      = null;
+let modelLoaded  = false;
+let generating   = false;
+let abortFlag    = false;
+let gpuAdapter   = null;
+let gpuDevice    = null;
+
+// ── DOM References ─────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+const dom = {
+  noGpuOverlay:  $('noGpuOverlay'),
+  gpuBadge:      $('gpuBadge'),
+  btnLoad:       $('btnLoad'),
+  loadProgress:  $('loadProgress'),
+  loadBar:       $('loadBar'),
+  loadStatus:    $('loadStatus'),
+  btnRun:        $('btnRun'),
+  btnStop:       $('btnStop'),
+  codeInput:     $('codeInput'),
+  codeOutput:    $('codeOutput'),
+  inputTokens:   $('inputTokens'),
+  outputTokens:  $('outputTokens'),
+  gutterIn:      $('gutterIn'),
+  gutterOut:     $('gutterOut'),
+  logContent:    $('logContent'),
+  statusDot:     $('statusDot'),
+  statusText:    $('statusText'),
+  statusModel:   $('statusModel'),
+  statusGpu:     $('statusGpu'),
+  headerDot:     $('headerDot'),
+
+  sliderTokens:  $('sliderTokens'),
+  sliderTemp:    $('sliderTemp'),
+  sliderTopP:    $('sliderTopP'),
+  sliderPres:    $('sliderPres'),
+  sliderCount:   $('sliderCount'),
+  valTokens:     $('valTokens'),
+  valTemp:       $('valTemp'),
+  valTopP:       $('valTopP'),
+  valPres:       $('valPres'),
+  valCount:      $('valCount'),
+
+  statPrefill:   $('statPrefill'),
+  statGen:       $('statGen'),
+  statTokenCount:$('statTokenCount'),
+  statTime:      $('statTime'),
+};
+
+// ── Logging ────────────────────────────────────────────────
+function log(msg, level = 'info') {
+  const cls = { info: 'log-info', ok: 'log-ok', warn: 'log-warn', err: 'log-err' }[level] || '';
+  const ts = new Date().toLocaleTimeString('en', { hour12: false });
+  dom.logContent.innerHTML += `<div><span style="color:var(--fg-muted)">[${ts}]</span> <span class="${cls}">${msg}</span></div>`;
+  dom.logContent.scrollTop = dom.logContent.scrollHeight;
+}
+
+// ── Gutter Line Numbers ────────────────────────────────────
+function updateGutter(textareaOrText, gutterEl) {
+  const text = typeof textareaOrText === 'string' ? textareaOrText : textareaOrText.value;
+  const count = (text.match(/\n/g) || []).length + 1;
+  gutterEl.innerHTML = Array.from({ length: count }, (_, i) => i + 1).join('<br>');
+}
+
+dom.codeInput.addEventListener('input', () => {
+  updateGutter(dom.codeInput, dom.gutterIn);
+});
+updateGutter(dom.codeInput, dom.gutterIn);
+
+// ── Slider Bindings ────────────────────────────────────────
+function bindSlider(slider, display, fmt) {
+  slider.addEventListener('input', () => { display.textContent = fmt(slider.value); });
+}
+
+bindSlider(dom.sliderTokens, dom.valTokens, v => v);
+bindSlider(dom.sliderTemp,   dom.valTemp,   v => (v / 100).toFixed(2));
+bindSlider(dom.sliderTopP,   dom.valTopP,   v => (v / 100).toFixed(2));
+bindSlider(dom.sliderPres,   dom.valPres,   v => (v / 100).toFixed(2));
+bindSlider(dom.sliderCount,  dom.valCount,  v => (v / 100).toFixed(2));
+
+function getParams() {
+  return {
+    maxTokens:  parseInt(dom.sliderTokens.value),
+    temperature: parseInt(dom.sliderTemp.value) / 100,
+    topP:        parseInt(dom.sliderTopP.value) / 100,
+    presencePenalty:  parseInt(dom.sliderPres.value) / 100,
+    countPenalty:     parseInt(dom.sliderCount.value) / 100,
+  };
+}
+
+// ── WebGPU Detection ───────────────────────────────────────
+async function initWebGPU() {
+  if (!navigator.gpu) {
+    dom.noGpuOverlay.classList.remove('hidden');
+    dom.gpuBadge.textContent = 'NO WEBGPU';
+    dom.statusText.textContent = 'WebGPU not available';
+    dom.statusDot.classList.add('error');
+    log('WebGPU not supported in this browser', 'err');
+    return false;
+  }
+
+  try {
+    gpuAdapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!gpuAdapter) throw new Error('No adapter');
+
+    const info = await gpuAdapter.info;
+    const name = info?.device || info?.description || 'Unknown GPU';
+    const backend = info?.architecture || '';
+
+    dom.gpuBadge.textContent = name;
+    dom.gpuBadge.classList.add('ok');
+    dom.statusGpu.textContent = `${name}${backend ? ' (' + backend + ')' : ''}`;
+    dom.statusDot.classList.add('ready');
+    dom.statusText.textContent = 'WebGPU ready';
+    dom.btnLoad.disabled = false;
+    log(`WebGPU adapter: <b>${name}</b> ${backend}`, 'ok');
+
+    return true;
+  } catch (e) {
+    dom.noGpuOverlay.classList.remove('hidden');
+    dom.gpuBadge.textContent = 'GPU ERROR';
+    dom.statusText.textContent = 'GPU initialization failed';
+    dom.statusDot.classList.add('error');
+    log(`WebGPU error: ${e.message}`, 'err');
+    return false;
+  }
+}
+
+// ── WASM Module Loading ────────────────────────────────────
+async function loadWasmModule() {
+  log('Loading WASM module&hellip;');
+  try {
+    wasmModule = await import(WASM_MODULE_PATH);
+    if (wasmModule.default) {
+      await wasmModule.default();
+    }
+    log('WASM module loaded', 'ok');
+    return true;
+  } catch (e) {
+    log(`Failed to load WASM module: ${e.message}`, 'err');
+    log(`Make sure to build with: <code>wasm-pack build --target web --features web</code>`, 'warn');
+    return false;
+  }
+}
+
+// ── Tokenizer Loading ──────────────────────────────────────
+async function loadTokenizer() {
+  log(`Fetching ${TOKENIZER_FILE}&hellip;`);
+  const resp = await fetch(`${MODEL_BASE_URL}/${TOKENIZER_FILE}`);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching tokenizer`);
+  const json = await resp.text();
+  tokenizer = new wasmModule.BpeTokenizer(json);
+  log('BpeTokenizer initialized', 'ok');
+}
+
+// ── Helper: download a file with streaming progress ─────────
+async function fetchWithProgress(url, onProgress) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching ${url}`);
+
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.byteLength;
+    if (onProgress) onProgress(received);
+  }
+
+  const buf = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buf.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return buf;
+}
+
+// ── Streaming safetensors shard reader ──────────────────────
+// Parses the safetensors header from a streaming fetch, then
+// extracts individual tensors without buffering the full shard.
+class ShardReader {
+  constructor(bodyReader) {
+    this.reader = bodyReader;
+    this.chunks = [];
+    this.buffered = 0;
+    this.done = false;
+    this.totalReceived = 0;
+  }
+
+  async ensure(n) {
+    while (this.buffered < n && !this.done) {
+      const { done, value } = await this.reader.read();
+      if (done) { this.done = true; break; }
+      this.chunks.push(value);
+      this.buffered += value.byteLength;
+      this.totalReceived += value.byteLength;
+    }
+    if (this.buffered < n) throw new Error('Unexpected end of safetensors stream');
+  }
+
+  take(n) {
+    const result = new Uint8Array(n);
+    let off = 0;
+    while (off < n) {
+      const chunk = this.chunks[0];
+      const need = n - off;
+      if (chunk.byteLength <= need) {
+        result.set(chunk, off);
+        off += chunk.byteLength;
+        this.buffered -= chunk.byteLength;
+        this.chunks.shift();
+      } else {
+        result.set(chunk.subarray(0, need), off);
+        this.chunks[0] = chunk.subarray(need);
+        this.buffered -= need;
+        off = n;
+      }
+    }
+    return result;
+  }
+
+  skip(n) {
+    let remaining = n;
+    while (remaining > 0) {
+      const chunk = this.chunks[0];
+      if (chunk.byteLength <= remaining) {
+        remaining -= chunk.byteLength;
+        this.buffered -= chunk.byteLength;
+        this.chunks.shift();
+      } else {
+        this.chunks[0] = chunk.subarray(remaining);
+        this.buffered -= remaining;
+        remaining = 0;
+      }
+    }
+  }
+}
+
+/**
+ * Stream-download a safetensors shard and upload tensors one at a time.
+ * This avoids allocating a single ArrayBuffer for the full shard,
+ * which would fail for shards > ~4 GB (browser limit).
+ */
+async function loadShardStreaming(url, builder, onBytesReceived) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching ${url}`);
+
+  const sr = new ShardReader(resp.body.getReader());
+
+  // 1. Read 8-byte header length (u64 LE)
+  await sr.ensure(8);
+  const lenBytes = sr.take(8);
+  const headerLen = Number(new DataView(lenBytes.buffer, lenBytes.byteOffset, 8).getBigUint64(0, true));
+
+  // 2. Read and parse header JSON
+  await sr.ensure(headerLen);
+  const headerBytes = sr.take(headerLen);
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+
+  // 3. Collect and sort tensors by data offset
+  const tensors = [];
+  for (const [name, info] of Object.entries(header)) {
+    if (name === '__metadata__') continue;
+    tensors.push({
+      name,
+      dtype: info.dtype,
+      shape: info.shape,
+      start: info.data_offsets[0],
+      end: info.data_offsets[1],
+    });
+  }
+  tensors.sort((a, b) => a.start - b.start);
+
+  // 4. Read each tensor and upload to GPU
+  let dataPos = 0;
+  let tensorCount = 0;
+  for (const t of tensors) {
+    // Skip any gap between tensors
+    if (t.start > dataPos) {
+      const gap = t.start - dataPos;
+      await sr.ensure(gap);
+      sr.skip(gap);
+      dataPos = t.start;
+    }
+
+    // Read tensor bytes
+    const tensorSize = t.end - t.start;
+    await sr.ensure(tensorSize);
+    const tensorData = sr.take(tensorSize);
+    dataPos = t.end;
+
+    // Upload to GPU via WASM
+    builder.add_tensor(t.name, new Uint32Array(t.shape), t.dtype, tensorData);
+    tensorCount++;
+
+    if (onBytesReceived) onBytesReceived(sr.totalReceived);
+  }
+
+  // 5. Flush GPU uploads
+  builder.flush();
+
+  return { tensorCount, bytesReceived: sr.totalReceived };
+}
+
+// ── Model Loading ──────────────────────────────────────────
+async function loadModel() {
+  dom.loadProgress.classList.add('active');
+  dom.loadBar.style.width = '0%';
+
+  let totalBytes = 0;
+  let loadedBytes = 0;
+
+  // Pre-flight: get total size
+  for (const file of MODEL_FILES) {
+    const head = await fetch(`${MODEL_BASE_URL}/${file}`, { method: 'HEAD' });
+    const size = parseInt(head.headers.get('content-length') || '0');
+    totalBytes += size;
+  }
+
+  if (totalBytes > 0) {
+    log(`Model size: ${(totalBytes / 1e9).toFixed(2)} GB`);
+  }
+
+  function onProgress(fileLoaded) {
+    const pct = totalBytes > 0 ? ((loadedBytes + fileLoaded) / totalBytes * 100) : 0;
+    dom.loadBar.style.width = `${pct.toFixed(1)}%`;
+    dom.loadStatus.textContent = `${((loadedBytes + fileLoaded) / 1e6).toFixed(0)} / ${(totalBytes / 1e6).toFixed(0)} MB`;
+  }
+
+  // ── Build model via WASM ──
+  try {
+    if (MODEL_INDEX_FILE && MODEL_FILES.length > 1) {
+      // ── Sharded model: use WasmSessionBuilder for incremental loading ──
+      log(`Fetching shard index: ${MODEL_INDEX_FILE}&hellip;`);
+      const indexResp = await fetch(`${MODEL_BASE_URL}/${MODEL_INDEX_FILE}`);
+      if (!indexResp.ok) throw new Error(`HTTP ${indexResp.status} fetching ${MODEL_INDEX_FILE}`);
+      const indexJson = await indexResp.text();
+
+      const builder = new wasmModule.WasmSessionBuilder(indexJson, 128, 0);
+      log('Creating WebGPU context&hellip;');
+      await builder.prepare();
+      log('WebGPU context ready', 'ok');
+
+      for (const file of MODEL_FILES) {
+        log(`Streaming ${file} &rarr; GPU&hellip;`);
+        const shardUrl = `${MODEL_BASE_URL}/${file}`;
+        const { tensorCount, bytesReceived } = await loadShardStreaming(
+          shardUrl, builder,
+          (received) => {
+            const pct = totalBytes > 0 ? ((loadedBytes + received) / totalBytes * 100) : 0;
+            dom.loadBar.style.width = `${pct.toFixed(1)}%`;
+            dom.loadStatus.textContent = `${((loadedBytes + received) / 1e6).toFixed(0)} / ${(totalBytes / 1e6).toFixed(0)} MB`;
+          }
+        );
+        loadedBytes += bytesReceived;
+        log(`${file}: ${tensorCount} tensors uploaded (${(bytesReceived / 1e6).toFixed(1)} MB)`, 'ok');
+      }
+
+      dom.loadBar.style.width = '100%';
+      dom.loadStatus.textContent = 'Building model on GPU&hellip;';
+      log('Building model on GPU&hellip;');
+
+      runtime = await builder.build();
+    } else {
+      // ── Single-file model ──
+      const file = MODEL_FILES[0];
+      log(`Downloading ${file}&hellip;`);
+      const buf = await fetchWithProgress(`${MODEL_BASE_URL}/${file}`, onProgress);
+      log(`Loaded ${file} (${(buf.byteLength / 1e6).toFixed(1)} MB)`, 'ok');
+
+      dom.loadBar.style.width = '100%';
+      dom.loadStatus.textContent = 'Building model on GPU&hellip;';
+      log('Building model on GPU&hellip;');
+
+      runtime = await wasmModule.WasmSession.create(buf, 128, 0);
+    }
+
+    modelLoaded = true;
+    dom.loadStatus.textContent = 'Model ready';
+    log(`Model built: ${runtime.version}, ${runtime.num_layer} layers, d=${runtime.num_emb}, vocab=${runtime.num_vocab}`, 'ok');
+
+    // Debug: log model detection info
+    try {
+      const info = JSON.parse(runtime.debug_info());
+      console.log('[debug_info]', info);
+      log(`Model info: head=${info.num_head}, kv_head=${info.num_kv_head}, head_dim=${info.head_dim}, intermediate=${info.intermediate_size}, qk_norm=${info.has_qk_norm}, gated_ffn=${info.gated_ffn}, act=${info.hidden_act}, rope_theta=${info.rope_theta}`, 'ok');
+    } catch (e) {
+      log(`debug_info: ${e.message}`, 'warn');
+    }
+
+    // Debug: sample embed and norm values to verify data integrity
+    try {
+      const emb0 = runtime.debug_embed(0, 8);
+      console.log('[debug_embed token=0]', Array.from(emb0).map(v => v.toFixed(6)));
+      const emb1 = runtime.debug_embed(1, 8);
+      console.log('[debug_embed token=1]', Array.from(emb1).map(v => v.toFixed(6)));
+      log(`Embed[0][0:8]: ${Array.from(emb0).map(v => v.toFixed(4)).join(', ')}`, 'ok');
+
+      const norm0 = await runtime.debug_norm_weight(0, 8);
+      console.log('[debug_norm layer=0]', Array.from(norm0).map(v => v.toFixed(6)));
+      const normH = await runtime.debug_norm_weight(-1, 8);
+      console.log('[debug_norm head]', Array.from(normH).map(v => v.toFixed(6)));
+      log(`Norm[0][0:8]: ${Array.from(norm0).map(v => v.toFixed(4)).join(', ')}`, 'ok');
+    } catch (e) {
+      log(`debug tensors: ${e.message}`, 'warn');
+      if (e.stack) console.error(e.stack);
+    }
+  } catch (e) {
+    log(`Model build: ${e.message}`, 'err');
+    if (e.stack) log(`Stack: ${e.stack}`, 'err');
+    dom.loadStatus.textContent = `Error: ${e.message}`;
+    modelLoaded = false;
+  }
+}
+
+/**
+ * Run one inference step: feed tokens, get back raw logits.
+ * Handles the WasmSession.infer_raw() async call.
+ */
+async function inferStep(tokens) {
+  if (!runtime) throw new Error('No runtime loaded');
+  return await runtime.infer_raw(tokens);
+}
+
+// ── Sampling ───────────────────────────────────────────────
+function sampleToken(logits, temperature, topP, presencePenalty, countPenalty, occurrences) {
+  // Apply repetition penalty
+  if (presencePenalty > 0 || countPenalty > 0) {
+    for (const [tokenId, count] of occurrences) {
+      logits[tokenId] -= presencePenalty + count * countPenalty;
+    }
+  }
+
+  if (temperature <= 0.01) {
+    // Greedy: argmax
+    let maxI = 0;
+    for (let i = 1; i < logits.length; i++) {
+      if (logits[i] > logits[maxI]) maxI = i;
+    }
+    return maxI;
+  }
+
+  // Apply temperature
+  for (let i = 0; i < logits.length; i++) logits[i] /= temperature;
+
+  // Softmax
+  let max = -Infinity;
+  for (let i = 0; i < logits.length; i++) if (logits[i] > max) max = logits[i];
+  let sum = 0;
+  for (let i = 0; i < logits.length; i++) {
+    logits[i] = Math.exp(logits[i] - max);
+    sum += logits[i];
+  }
+  for (let i = 0; i < logits.length; i++) logits[i] /= sum;
+
+  // Top-P nucleus sampling
+  const sorted = Array.from(logits).map((p, i) => [p, i]).sort((a, b) => b[0] - a[0]);
+  let cumSum = 0;
+  const nucleus = [];
+  for (const [p, i] of sorted) {
+    nucleus.push([p, i]);
+    cumSum += p;
+    if (cumSum >= topP) break;
+  }
+
+  // Re-normalize
+  const nucleusSum = nucleus.reduce((a, [p]) => a + p, 0);
+  const r = Math.random() * nucleusSum;
+  let acc = 0;
+  for (const [p, i] of nucleus) {
+    acc += p;
+    if (acc >= r) return i;
+  }
+  return nucleus[nucleus.length - 1][1];
+}
+
+// ── Inference Loop ─────────────────────────────────────────
+async function generate() {
+  if (!tokenizer || generating) return;
+
+  const prompt = dom.codeInput.value;
+  if (!prompt.trim()) { log('Empty prompt', 'warn'); return; }
+
+  generating = true;
+  abortFlag = false;
+  dom.btnRun.disabled = true;
+  dom.btnStop.classList.remove('hidden');
+
+  // Reset output
+  dom.codeOutput.innerHTML = '';
+  dom.statusText.textContent = 'Generating&hellip;';
+  dom.statusDot.className = 'status-dot loading';
+
+  const params = getParams();
+  const encoder = new TextEncoder();
+  const promptBytes = encoder.encode(prompt);
+
+  let tokens;
+  try {
+    tokens = tokenizer.encode(promptBytes);
+    dom.inputTokens.textContent = `${tokens.length} tokens`;
+    log(`Prompt: ${tokens.length} tokens`);
+  } catch (e) {
+    log(`Tokenization error: ${e.message}`, 'err');
+    finishGeneration();
+    return;
+  }
+
+  // Show prompt in output
+  dom.codeOutput.innerHTML = escapeHtml(prompt);
+
+  const prefillStart = performance.now();
+  let genStart = null;
+  let genCount = 0;
+  const occurrences = new Map();
+
+  // ── Inference via WasmSession ──
+  if (runtime) {
+    try {
+      // Reset state for a fresh generation
+      runtime.reset_state();
+
+      // Prefill: feed all prompt tokens at once
+      let logits = await inferStep(new Uint32Array(tokens));
+      const prefillMs = performance.now() - prefillStart;
+      const prefillTps = tokens.length / (prefillMs / 1000);
+      dom.statPrefill.innerHTML = `${prefillTps.toFixed(1)} <span class="stat-unit">tok/s</span>`;
+      log(`Prefill: ${tokens.length} tokens in ${prefillMs.toFixed(0)}ms (${prefillTps.toFixed(1)} tok/s)`, 'ok');
+
+      // Debug: log logit stats
+      function logitStats(arr, label) {
+        let min = Infinity, max = -Infinity, sum = 0, nanCount = 0, infCount = 0;
+        let argmax = 0;
+        for (let i = 0; i < arr.length; i++) {
+          const v = arr[i];
+          if (isNaN(v)) { nanCount++; continue; }
+          if (!isFinite(v)) { infCount++; continue; }
+          if (v < min) min = v;
+          if (v > max) { max = v; argmax = i; }
+          sum += v;
+        }
+        const mean = sum / (arr.length - nanCount - infCount);
+        // Top-5 tokens
+        const indexed = Array.from(arr).map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]);
+        const top5 = indexed.slice(0, 5).map(([v, i]) => `${i}(${v.toFixed(2)})`).join(' ');
+        console.log(`[${label}] len=${arr.length} min=${min.toFixed(4)} max=${max.toFixed(4)} mean=${mean.toFixed(4)} nan=${nanCount} inf=${infCount} argmax=${argmax} top5=[${top5}]`);
+      }
+      logitStats(new Float32Array(logits), 'prefill');
+
+      genStart = performance.now();
+
+      // Generate tokens one by one
+      for (let i = 0; i < params.maxTokens; i++) {
+        if (abortFlag) break;
+
+        const logitsArr = new Float32Array(logits);
+        const token = sampleToken(logitsArr, params.temperature, params.topP, params.presencePenalty, params.countPenalty, occurrences);
+
+        occurrences.set(token, (occurrences.get(token) || 0) + 1);
+
+        // Decode and display
+        const decoded = tokenizer.decode(new Uint32Array([token]));
+        const text = new TextDecoder().decode(decoded);
+        appendGenerated(text);
+
+        genCount++;
+        updateGenStats(genStart, genCount);
+
+        // Feed token back for next step
+        logits = await inferStep(new Uint32Array([token]));
+        if (i < 20) logitStats(new Float32Array(logits), `gen-${i} tok=${token}`);
+
+        // Yield to UI
+        await new Promise(r => setTimeout(r, 0));
+      }
+    } catch (e) {
+      log(`Inference error: ${e.message}`, 'err');
+    }
+  } else {
+    // ── Demo mode: tokenizer-only ──
+    log('Running in demo mode (tokenizer only &mdash; model pipeline not connected)', 'warn');
+
+    dom.statPrefill.innerHTML = `&mdash; <span class="stat-unit">tok/s</span>`;
+    genStart = performance.now();
+
+    // Demonstrate the tokenizer round-trip
+    const roundTrip = tokenizer.decode(new Uint32Array(tokens));
+    const rtText = new TextDecoder().decode(roundTrip);
+    log(`Tokenizer round-trip: ${tokens.length} tokens &rarr; ${rtText.length} bytes`, 'ok');
+
+    // Show animated placeholder to demonstrate the streaming UI
+    const demoText = `    if n <= 0:\n        return []\n    fib = [0, 1]\n    for i in range(2, n):\n        fib.append(fib[-1] + fib[-2])\n    return fib[:n]\n`;
+    for (const ch of demoText) {
+      if (abortFlag) break;
+      appendGenerated(ch);
+      genCount++;
+      updateGenStats(genStart, genCount);
+      await new Promise(r => setTimeout(r, 20 + Math.random() * 30));
+    }
+  }
+
+  finishGeneration();
+}
+
+function appendGenerated(text) {
+  // Remove existing cursor
+  const existing = dom.codeOutput.querySelector('.cursor-blink');
+  if (existing) existing.remove();
+
+  const span = document.createElement('span');
+  span.className = 'generated';
+  span.textContent = text;
+  dom.codeOutput.appendChild(span);
+
+  // Add cursor
+  const cursor = document.createElement('span');
+  cursor.className = 'cursor-blink';
+  dom.codeOutput.appendChild(cursor);
+
+  // Update gutter
+  updateGutter(dom.codeOutput.textContent, dom.gutterOut);
+
+  // Auto-scroll
+  dom.codeOutput.parentElement.scrollTop = dom.codeOutput.parentElement.scrollHeight;
+}
+
+function updateGenStats(start, count) {
+  const elapsed = (performance.now() - start) / 1000;
+  const tps = count / elapsed;
+  dom.statGen.innerHTML = `${tps.toFixed(1)} <span class="stat-unit">tok/s</span>`;
+  dom.statTokenCount.textContent = count;
+  dom.statTime.innerHTML = `${elapsed.toFixed(1)} <span class="stat-unit">s</span>`;
+  dom.outputTokens.textContent = `${count} tokens`;
+}
+
+function finishGeneration() {
+  generating = false;
+  abortFlag = false;
+  dom.btnRun.disabled = !modelLoaded;
+  dom.btnStop.classList.add('hidden');
+  dom.statusText.textContent = modelLoaded ? 'Ready' : 'No model';
+  dom.statusDot.className = `status-dot ${modelLoaded ? 'ready' : ''}`;
+
+  // Remove cursor
+  const cursor = dom.codeOutput.querySelector('.cursor-blink');
+  if (cursor) cursor.remove();
+
+  log('Generation complete');
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ── Event Handlers ─────────────────────────────────────────
+dom.btnLoad.addEventListener('click', async () => {
+  dom.btnLoad.disabled = true;
+  dom.statusText.textContent = 'Loading model&hellip;';
+  dom.statusDot.className = 'status-dot loading';
+
+  try {
+    // Step 1: Load WASM module
+    const wasmOk = await loadWasmModule();
+
+    // Step 2: Load tokenizer
+    await loadTokenizer();
+
+    // Step 3: Load model weights
+    await loadModel();
+
+    dom.btnRun.disabled = false;
+    dom.statusModel.textContent = 'PowerCoder-3B (Brumby)';
+    dom.statusText.textContent = 'Ready';
+    dom.statusDot.className = 'status-dot ready';
+  } catch (e) {
+    log(`Load failed: ${e.message}`, 'err');
+    dom.loadStatus.textContent = `Error: ${e.message}`;
+    dom.statusText.textContent = 'Load failed';
+    dom.statusDot.className = 'status-dot error';
+    dom.btnLoad.disabled = false;
+  }
+});
+
+dom.btnRun.addEventListener('click', generate);
+dom.btnStop.addEventListener('click', () => { abortFlag = true; });
+
+// Ctrl+Enter to generate
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !dom.btnRun.disabled) {
+    e.preventDefault();
+    generate();
+  }
+});
+
+// ── Init ───────────────────────────────────────────────────
+(async function init() {
+  log('PowerCoder-3B &mdash; Browser Inference Engine');
+  log('web-rwkv v0.10.19 &mdash; Brumby runtime &mdash; WebGPU backend');
+  await initWebGPU();
+})();
+</script>
+</body>
+</html>

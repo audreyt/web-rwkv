@@ -64,7 +64,7 @@ impl<'de, T: Scalar + Deserialize<'de>> Deserialize<'de> for TensorCpu<T> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 impl<T: Scalar + Serialize, K: Kind> Serialize for TensorGpu<T, K> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -74,7 +74,7 @@ impl<T: Scalar + Serialize, K: Kind> Serialize for TensorGpu<T, K> {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
 impl<T: Scalar + Serialize, K: Kind> Serialize for TensorGpu<T, K> {
     fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
     where

@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashMap};
 
 use half::f16;
 use itertools::Itertools;
@@ -73,6 +73,87 @@ impl Reader for SafeTensors<'_> {
     }
 }
 
+/// A reader that spans multiple safetensors shard files.
+///
+/// Brumby 14B (and other large HuggingFace models) distribute tensors across
+/// multiple `.safetensors` files with a `model.safetensors.index.json` mapping
+/// tensor names to shard filenames.
+pub struct ShardedSafeTensors<'a> {
+    /// Map from tensor name to shard index.
+    index: HashMap<String, usize>,
+    /// Loaded shard SafeTensors instances.
+    shards: Vec<SafeTensors<'a>>,
+}
+
+impl<'a> ShardedSafeTensors<'a> {
+    /// Construct from an index JSON string and pre-loaded shard data.
+    ///
+    /// `shard_files` maps shard filenames (e.g. `"model-00001-of-00004.safetensors"`)
+    /// to their raw bytes. The index JSON's `weight_map` is used to route tensor
+    /// lookups to the correct shard.
+    pub fn new(
+        index_json: &str,
+        shard_files: &[(&str, &'a [u8])],
+    ) -> Result<Self, LoaderError> {
+        #[derive(serde::Deserialize)]
+        struct IndexJson {
+            weight_map: HashMap<String, String>,
+        }
+
+        let parsed: IndexJson =
+            serde_json::from_str(index_json).map_err(|_| LoaderError::InvalidVersion)?;
+
+        // Build a map from shard filename to index in the shards vec.
+        let mut filename_to_idx: HashMap<String, usize> = HashMap::new();
+        let mut shards = Vec::new();
+        for &(filename, data) in shard_files {
+            let idx = shards.len();
+            filename_to_idx.insert(filename.to_string(), idx);
+            shards.push(SafeTensors::deserialize(data)?);
+        }
+
+        // Build tensor name -> shard index map.
+        let mut index = HashMap::new();
+        for (tensor_name, shard_filename) in parsed.weight_map {
+            let shard_idx = filename_to_idx
+                .get(&shard_filename)
+                .ok_or(LoaderError::InvalidVersion)?;
+            index.insert(tensor_name, *shard_idx);
+        }
+
+        Ok(Self { index, shards })
+    }
+}
+
+impl Reader for ShardedSafeTensors<'_> {
+    fn names(&self) -> Vec<&str> {
+        self.index.keys().map(|s| s.as_str()).collect()
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    fn shape(&self, name: &str) -> Result<Vec<usize>, SafeTensorError> {
+        let shard_idx = self
+            .index
+            .get(name)
+            .ok_or(SafeTensorError::TensorNotFound(name.to_string()))?;
+        Ok(self.shards[*shard_idx].tensor(name)?.shape().to_vec())
+    }
+
+    fn tensor(&self, name: &str) -> Result<ReaderTensor<'_>, SafeTensorError> {
+        let shard_idx = self
+            .index
+            .get(name)
+            .ok_or(SafeTensorError::TensorNotFound(name.to_string()))?;
+        let tensor = self.shards[*shard_idx].tensor(name)?;
+        let shape = tensor.shape().to_vec();
+        let data = tensor.data().into();
+        Ok((tensor.dtype(), shape, data))
+    }
+}
+
 pub trait TensorFromReader<T: Scalar> {
     /// Create a tensor from safetensors reader.
     fn from_reader(reader: ReaderTensor) -> Result<TensorCpu<T>, TensorError>;
@@ -80,18 +161,31 @@ pub trait TensorFromReader<T: Scalar> {
 
 impl<T: Scalar> TensorFromReader<T> for TensorCpu<T> {
     fn from_reader((dt, shape, data): ReaderTensor) -> Result<Self, TensorError> {
-        if T::DATA_TYPE != dt {
-            Err(TensorErrorKind::Type)?;
-        }
         let shape = Shape::from_slice_rev(&shape)?;
-        match data {
-            Cow::Borrowed(data) => Self::from_data(shape, bytemuck::cast_slice(data)),
-            Cow::Owned(data) => {
-                let data = bytemuck::cast_slice(&data);
-                let data = Cow::Owned(data.to_vec());
-                Self::from_data(shape, data)
-            }
+
+        // Fast path: dtype matches exactly.
+        if T::DATA_TYPE == dt {
+            return match data {
+                Cow::Borrowed(data) => Self::from_data(shape, bytemuck::cast_slice(data)),
+                Cow::Owned(data) => {
+                    let data = bytemuck::cast_slice(&data);
+                    let data = Cow::Owned(data.to_vec());
+                    Self::from_data(shape, data)
+                }
+            };
         }
+
+        // Conversion: f32 tensor → f16 target.
+        if T::DATA_TYPE == Dtype::F16 && dt == Dtype::F32 {
+            let f32_data: &[f32] = bytemuck::cast_slice(&data);
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&x| f16::from_f32(x).to_le_bytes())
+                .collect();
+            return Self::from_data(shape, bytemuck::cast_slice(&f16_bytes));
+        }
+
+        Err(TensorErrorKind::Type)?
     }
 }
 
@@ -200,6 +294,42 @@ pub struct Loader<R> {
 
 impl<R: Reader> Loader<R> {
     pub fn info(model: &R) -> Result<ModelInfo, LoaderError> {
+        // Check for PowerCoder (power retention + StarCoder2 FFN, no QK norms).
+        let powercoder = [
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.g_proj.weight",
+            "model.layers.0.mlp.c_fc.weight",
+            "model.layers.0.mlp.c_proj.weight",
+        ]
+        .iter()
+        .all(|n| model.contains(n))
+            && !model.contains("model.layers.0.self_attn.q_norm.weight");
+
+        if powercoder {
+            return Self::info_powercoder(model);
+        }
+
+        // Check for Brumby (HuggingFace-style tensor naming with power retention).
+        let brumby = [
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.self_attn.g_proj.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ]
+        .into_iter()
+        .all(|name| model.contains(name));
+
+        if brumby {
+            return Self::info_brumby(model);
+        }
+
         let num_layer = {
             let mut r: usize = 0;
             for i in model.names() {
@@ -285,6 +415,7 @@ impl<R: Reader> Loader<R> {
             ModelVersion::V4 => 1,
             ModelVersion::V5 | ModelVersion::V6 => model.shape("blocks.0.att.time_first")?[0],
             ModelVersion::V7 => model.shape("blocks.0.att.r_k")?[0],
+            ModelVersion::Brumby => unreachable!(),
         };
 
         let custom = match version {
@@ -311,6 +442,124 @@ impl<R: Reader> Loader<R> {
             num_layer,
             num_emb,
             num_hidden,
+            num_vocab,
+            num_head,
+            custom,
+        })
+    }
+
+    /// Extract model info for Brumby (HuggingFace-style tensor naming).
+    fn info_brumby(model: &R) -> Result<ModelInfo, LoaderError> {
+        let num_layer = {
+            let mut r: usize = 0;
+            for i in model.names() {
+                const PREFIX: &str = "model.layers.";
+                if let Some(i) = i.strip_prefix(PREFIX) {
+                    let i = &i[..i.find('.').unwrap_or(0)];
+                    r = r.max(i.parse::<usize>()?)
+                }
+            }
+            r + 1
+        };
+
+        // embed_tokens.weight shape: [vocab_size, hidden_size]
+        let embed = model.shape("model.embed_tokens.weight")?;
+        let num_vocab = embed[0];
+        let num_emb = embed[1];
+
+        // gate_proj.weight shape: [intermediate_size, hidden_size]
+        let ffn = model.shape("model.layers.0.mlp.gate_proj.weight")?;
+        let intermediate_size = ffn[0];
+
+        // q_proj.weight shape: [num_heads * head_dim, hidden_size]
+        let q_shape = model.shape("model.layers.0.self_attn.q_proj.weight")?;
+        // k_proj.weight shape: [num_kv_heads * head_dim, hidden_size]
+        let k_shape = model.shape("model.layers.0.self_attn.k_proj.weight")?;
+
+        // q_norm.weight shape: [head_dim]
+        let q_norm_shape = model.shape("model.layers.0.self_attn.q_norm.weight")?;
+        let head_dim = q_norm_shape[0];
+
+        let num_head = q_shape[0] / head_dim;
+        let num_kv_head = k_shape[0] / head_dim;
+
+        let custom = ModelCustomInfo::Brumby(
+            super::brumby::CustomInfo {
+                num_kv_head,
+                head_dim,
+                intermediate_size,
+                has_qk_norm: true,
+                gated_ffn: true,
+                hidden_act: Activation::Silu,
+                rope_theta_bits: 0,
+                power_deg: 1,
+            }
+            .with_rope_theta(1_000_000.0),
+        );
+
+        Ok(ModelInfo {
+            version: ModelVersion::Brumby,
+            num_layer,
+            num_emb,
+            num_hidden: intermediate_size,
+            num_vocab,
+            num_head,
+            custom,
+        })
+    }
+
+    fn info_powercoder(model: &R) -> Result<ModelInfo, LoaderError> {
+        let num_layer = {
+            let mut r: usize = 0;
+            for i in model.names() {
+                const PREFIX: &str = "model.layers.";
+                if let Some(i) = i.strip_prefix(PREFIX) {
+                    let i = &i[..i.find('.').unwrap_or(0)];
+                    r = r.max(i.parse::<usize>()?)
+                }
+            }
+            r + 1
+        };
+
+        // embed_tokens.weight shape: [vocab_size, hidden_size]
+        let embed = model.shape("model.embed_tokens.weight")?;
+        let num_vocab = embed[0];
+        let num_emb = embed[1];
+
+        // c_fc.weight shape: [intermediate_size, hidden_size]
+        let ffn = model.shape("model.layers.0.mlp.c_fc.weight")?;
+        let intermediate_size = ffn[0];
+
+        // q_proj.weight shape: [num_heads * head_dim, hidden_size]
+        let q_shape = model.shape("model.layers.0.self_attn.q_proj.weight")?;
+        // k_proj.weight shape: [num_kv_heads * head_dim, hidden_size]
+        let k_shape = model.shape("model.layers.0.self_attn.k_proj.weight")?;
+
+        // g_proj.weight shape: [num_kv_heads, hidden_size] (one gate per KV head group)
+        let g_shape = model.shape("model.layers.0.self_attn.g_proj.weight")?;
+        let num_kv_head = g_shape[0];
+        let head_dim = k_shape[0] / num_kv_head;
+        let num_head = q_shape[0] / head_dim;
+
+        let custom = ModelCustomInfo::Brumby(
+            super::brumby::CustomInfo {
+                num_kv_head,
+                head_dim,
+                intermediate_size,
+                has_qk_norm: false,
+                gated_ffn: false,
+                hidden_act: Activation::Gelu,
+                rope_theta_bits: 0,
+                power_deg: 2,
+            }
+            .with_rope_theta(10_000.0),
+        );
+
+        Ok(ModelInfo {
+            version: ModelVersion::Brumby,
+            num_layer,
+            num_emb,
+            num_hidden: intermediate_size,
             num_vocab,
             num_head,
             custom,

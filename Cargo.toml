@@ -27,6 +27,9 @@ version.workspace = true
 [workspace.dependencies]
 serde = "1.0"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 ahash = "0.8"
 bytemuck = { version = "1.24", features = ["extern_crate_alloc"] }
@@ -55,6 +58,9 @@ tracing-tracy = { version = "0.11", optional = true }
 trait-variant = "0.1"
 uid = "0.1"
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+getrandom = { version = "0.3", features = ["wasm_js"], optional = true }
 wgpu = "28.0"
 
 [dependencies.web-rwkv-derive]
@@ -84,7 +90,7 @@ default = ["native"]
 
 classic = ["tokio"]
 native = ["subgroup-ops", "tokio"]
-web = []
+web = ["wasm-bindgen-futures", "js-sys", "getrandom"]
 
 ## Enables subgroup operations in the kernels. Accelerates the inference on some device.
 subgroup-ops = []
@@ -94,3 +100,16 @@ tokio = ["dep:tokio"]
 trace = ["tracing", "tracing-subscriber", "tracing-tracy"]
 ## Enables backtrace for errors.
 backtrace = []
+
+[patch.crates-io]
+getrandom = { path = "/tmp/getrandom-wasm64" }
+wasm-bindgen = { path = "/tmp/wasm-bindgen-wasm64" }
+wasm-bindgen-macro = { path = "/tmp/wasm-bindgen-wasm64/crates/macro" }
+wasm-bindgen-macro-support = { path = "/tmp/wasm-bindgen-wasm64/crates/macro-support" }
+wasm-bindgen-shared = { path = "/tmp/wasm-bindgen-wasm64/crates/shared" }
+wasm-bindgen-futures = { path = "/tmp/wasm-bindgen-wasm64/crates/futures" }
+js-sys = { path = "/tmp/wasm-bindgen-wasm64/crates/js-sys" }
+wgpu = { path = "/tmp/wgpu-28.0.0" }
+wgpu-core = { path = "/tmp/wgpu-core-28.0.0" }
+wgpu-hal = { path = "/tmp/wgpu-hal-28.0.0" }
+wgpu-types = { path = "/tmp/wgpu-types-28.0.0" }

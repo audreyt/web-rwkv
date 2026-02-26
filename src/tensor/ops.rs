@@ -157,6 +157,7 @@ pub enum Activation {
     Softplus,
     Sigmoid,
     Silu,
+    Gelu,
 }
 
 impl std::fmt::Display for Activation {
@@ -231,6 +232,13 @@ fn silu(x: vec4<f32>) -> vec4<f32> {
 // Metal has some trouble with `tanh`.
 fn custom_tanh(x: vec4<f32>) -> vec4<f32> {
     return select(tanh(x), vec4<f32>(1.0), x > vec4<f32>(42.0));
+}
+
+fn gelu(x: vec4<f32>) -> vec4<f32> {
+    let k = 0.7978845608; // sqrt(2/pi)
+    let c = 0.044715;
+    let inner = k * (x + c * x * x * x);
+    return 0.5 * x * (1.0 + custom_tanh(inner));
 }
 ";
         self.insert("ACTIVATION_DEFINE".into(), ACTIVATION_DEFINE.to_string());
@@ -637,6 +645,70 @@ impl TensorOp {
         })
     }
 
+    /// Group RMS normalization applied on `x`, normalizing groups of `group_size` elements.
+    /// Used for per-head Q/K norms where the weight has shape `[group_size]` (= head_dim).
+    /// - `w` shape: `[group_size, 1, 1, 1]`.
+    /// - `b` shape: `[group_size, 1, 1, 1]`.
+    /// - `x` shape: `[num_groups * group_size, T, B, 1]`.
+    pub fn group_rms_norm(
+        w: &TensorGpu<f16, ReadWrite>,
+        b: &TensorGpu<f16, ReadWrite>,
+        x: &TensorGpu<impl Float, ReadWrite>,
+        group_size: u32,
+        eps: f32,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let context = x.context();
+        let shape = {
+            let [index, token, batch, _] = x.shape().into();
+            x.check_shape([index, token, batch, 1])?;
+            w.check_shape([group_size as usize, 1, 1, 1])?;
+            b.check_shape([group_size as usize, 1, 1, 1])?;
+            assert!(
+                index % group_size as usize == 0,
+                "x dim 0 ({index}) must be divisible by group_size ({group_size})"
+            );
+            x.shape()
+        };
+
+        let num_groups = shape[0] as u32 / group_size;
+
+        let key = PipelineKey::new(
+            "group_rms_norm",
+            "group_rms_norm",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .u32("GROUP_SIZE", group_size)
+                .tensor(x, None)
+                .f32("EPS", eps),
+        );
+
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/normalize.wgsl"),
+            &[
+                x.meta_layout(0),
+                w.layout(1, true),
+                b.layout(2, true),
+                x.layout(3, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, x)
+            .bind(1, w)
+            .bind(2, b)
+            .bind(3, x)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [num_groups, shape[1] as u32, shape[2] as u32],
+        })
+    }
+
     /// L2 normalization applied on `x`.
     /// - `x` shape: `[C, T, B]`.
     pub fn l2_norm(x: &TensorGpu<impl Float, ReadWrite>, eps: f32) -> Result<Self, TensorError> {
@@ -779,7 +851,7 @@ impl TensorOp {
         Ok(Self::Atom {
             pipeline,
             bindings,
-            dispatch: [matrix.shape[1] as u32 / 4, shape[1] as u32, shape[2] as u32],
+            dispatch: [u32::div_ceil(matrix.shape[1] as u32, 4), shape[1] as u32, shape[2] as u32],
         })
     }
 
@@ -881,7 +953,7 @@ impl TensorOp {
         Ok(Self::Atom {
             pipeline,
             bindings,
-            dispatch: [matrix.shape[1] as u32 / 4, shape[1] as u32, shape[2] as u32],
+            dispatch: [u32::div_ceil(matrix.shape[1] as u32, 4), shape[1] as u32, shape[2] as u32],
         })
     }
 
@@ -986,7 +1058,7 @@ impl TensorOp {
         Ok(Self::Atom {
             pipeline,
             bindings,
-            dispatch: [matrix.shape[1] as u32 / 4, shape[1] as u32, shape[2] as u32],
+            dispatch: [u32::div_ceil(matrix.shape[1] as u32, 4), shape[1] as u32, shape[2] as u32],
         })
     }
 
@@ -1282,7 +1354,7 @@ impl TensorOp {
             pipeline,
             bindings,
             dispatch: [
-                u32::div_ceil(shape[0] as u32 / 4, BLOCK_SIZE),
+                u32::div_ceil(u32::div_ceil(shape[0] as u32, 4), BLOCK_SIZE),
                 shape[1] as u32,
                 shape[2] as u32,
             ],
@@ -1367,7 +1439,7 @@ impl TensorOp {
             pipeline,
             bindings,
             dispatch: [
-                u32::div_ceil(shape[0] as u32 / 4, BLOCK_SIZE),
+                u32::div_ceil(u32::div_ceil(shape[0] as u32, 4), BLOCK_SIZE),
                 shape[1] as u32,
                 shape[2] as u32,
             ],
@@ -1457,6 +1529,155 @@ impl TensorOp {
                 shape[1] as u32,
                 shape[2] as u32,
             ],
+        })
+    }
+
+    /// Rotary Position Embedding (RoPE) applied in-place to `x`.
+    /// - `cursors` shape: `[num_token, 1, 1, 1]` — packed cursor encoding with position.
+    /// - `x` shape: `[num_heads * head_dim, num_token, 1, 1]` — Q or K tensor.
+    /// - `head_dim`: dimension per attention head.
+    /// - `num_heads`: number of attention heads (for Q) or KV heads (for K).
+    /// - `rope_theta`: RoPE base frequency (e.g. 1_000_000.0 for Brumby).
+    pub fn rope<T: Float>(
+        cursors: &TensorGpu<u32, ReadWrite>,
+        x: &TensorGpu<T, ReadWrite>,
+        head_dim: u32,
+        num_heads: u32,
+        rope_theta: f32,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 64;
+
+        let context = x.context();
+        let shape = x.shape();
+
+        let num_token = shape[1] as u32;
+        let head_dim_4 = head_dim / 4;
+
+        cursors.check_shape([shape[1], 1, 1, 1])?;
+
+        let key = PipelineKey::new(
+            "rope",
+            "rope",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .u32("HEAD_DIM", head_dim)
+                .u32("NUM_HEADS", num_heads)
+                .f32("ROPE_THETA", rope_theta)
+                .tensor(x, None),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/rope.wgsl"),
+            &[
+                x.meta_layout(0),
+                cursors.layout(1, true),
+                x.layout(2, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, x)
+            .bind(1, cursors)
+            .bind(2, x)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(head_dim_4, BLOCK_SIZE),
+                num_heads,
+                num_token,
+            ],
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn power_retention<'a, T: Float>(
+        cursors: &TensorGpu<u32, ReadWrite>,
+        state: impl Into<TensorGpuView<'a, f32>>,
+        sum_of_keys: &TensorGpu<f32, ReadWrite>,
+        gate: &TensorGpu<T, ReadWrite>,
+        q: &TensorGpu<T, ReadWrite>,
+        k: &TensorGpu<T, ReadWrite>,
+        v: &TensorGpu<T, ReadWrite>,
+        output: &TensorGpu<T, ReadWrite>,
+        head_dim: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        num_gate_heads: u32,
+        expanded_dim: u32,
+    ) -> Result<Self, TensorError> {
+        let head_size = head_dim / 4;
+        let block_size = head_size;
+
+        let state: TensorGpuView<_> = state.into();
+        let context = q.context();
+        let shape = q.shape();
+
+        let q_dim = (num_heads * head_dim) as usize;
+        let kv_dim = (num_kv_heads * head_dim) as usize;
+        let group_ratio = num_heads / num_kv_heads;
+
+        q.check_shape([q_dim, shape[1], 1, 1])?;
+        k.check_shape([kv_dim, shape[1], 1, 1])?;
+        v.check_shape([kv_dim, shape[1], 1, 1])?;
+        output.check_shape([q_dim, shape[1], 1, 1])?;
+        state.check_shape([kv_dim, expanded_dim as usize, state.shape()[2], 1])?;
+        cursors.check_shape([shape[1], 1, 1, 1])?;
+
+        let gate_stride = gate.shape()[0] as u32;
+        let num_block_pairs = expanded_dim / (8 * 16); // OuterBlock * InnerBlock = 128
+        let key = PipelineKey::new(
+            "power_retention",
+            "power_retention",
+            Macros::new()
+                .u32("BLOCK_SIZE", block_size)
+                .u32("HEAD_SIZE", head_size)
+                .u32("HEAD_DIM", head_dim)
+                .u32("NUM_HEADS", num_heads)
+                .u32("NUM_KV_HEADS", num_kv_heads)
+                .u32("NUM_GATE_HEADS", num_gate_heads)
+                .u32("GATE_STRIDE", gate_stride)
+                .u32("GROUP_RATIO", group_ratio)
+                .u32("EXPANDED_DIM", expanded_dim)
+                .u32("NUM_BLOCK_PAIRS", num_block_pairs)
+                .tensor(q, None),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/power_retention.wgsl"),
+            &[
+                q.meta_layout(0),
+                state.meta_layout(1),
+                cursors.layout(2, true),
+                state.layout(3, false),
+                gate.layout(4, true),
+                q.layout(5, true),
+                k.layout(6, true),
+                v.layout(7, true),
+                output.layout(8, false),
+                sum_of_keys.layout(9, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, q)
+            .bind_meta(1, &state)
+            .bind(2, cursors)
+            .bind(3, &state)
+            .bind(4, gate)
+            .bind(5, q)
+            .bind(6, k)
+            .bind(7, v)
+            .bind(8, output)
+            .bind(9, sum_of_keys)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [num_kv_heads, 1, 1],
         })
     }
 

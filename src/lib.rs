@@ -40,4 +40,7 @@ pub mod runtime;
 pub mod tensor;
 pub mod tokenizer;
 
+#[cfg(feature = "web")]
+pub mod web;
+
 pub use wgpu;

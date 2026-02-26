@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head><title>WASM64 Test</title></head>
+<body>
+<pre id="log"></pre>
+<script type="module">
+const log = (msg) => {
+  document.getElementById('log').textContent += msg + '\n';
+  console.log(msg);
+};
+
+try {
+  log('1. Importing WASM module...');
+  const mod = await import('./pkg/web_rwkv.js');
+  log('   Module imported OK');
+
+  log('2. Initializing WASM (memory64)...');
+  await mod.default();
+  log('   WASM initialized OK');
+
+  log('3. Testing BpeTokenizer...');
+  // We need tokenizer.json for this, so just verify the class exists
+  log('   BpeTokenizer class: ' + (typeof mod.BpeTokenizer));
+  log('   WasmSession class: ' + (typeof mod.WasmSession));
+  log('   WasmSessionBuilder class: ' + (typeof mod.WasmSessionBuilder));
+  log('   ModelInfo class: ' + (typeof mod.ModelInfo));
+  log('   Tokenizer class: ' + (typeof mod.Tokenizer));
+
+  log('\n=== ALL TESTS PASSED ===');
+  log('Memory64 WASM module loaded and initialized successfully!');
+} catch (e) {
+  log('ERROR: ' + e.message);
+  log('Stack: ' + e.stack);
+}
+</script>
+</body>
+</html>

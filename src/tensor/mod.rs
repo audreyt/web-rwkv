@@ -519,7 +519,7 @@ impl<T: Scalar, K: Kind> TensorInto<TensorGpu<T, K>> for TensorCpu<T> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 impl<T: Scalar> TensorInto<TensorGpu<T, ReadWrite>> for TensorGpu<T, ReadWrite> {
     fn to(self, context: &Context) -> Self {
         match context {
@@ -529,7 +529,7 @@ impl<T: Scalar> TensorInto<TensorGpu<T, ReadWrite>> for TensorGpu<T, ReadWrite> 
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
 impl<T: Scalar> TensorInto<TensorGpu<T, ReadWrite>> for TensorGpu<T, ReadWrite> {
     fn to(self, _: &Context) -> Self {
         self
@@ -624,7 +624,7 @@ impl<T: Scalar, K: Kind> TensorGpu<T, K> {
         })
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     pub fn back_in_place(&self) -> TensorCpu<T> {
         use crate::context::ContextEvent;
 
@@ -667,7 +667,7 @@ impl<T: Scalar, K: Kind> TensorGpu<T, K> {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     pub async fn back(&self) -> TensorCpu<T> {
         if self.is_empty() {
             return TensorCpu {
@@ -713,7 +713,7 @@ impl<T: Scalar, K: Kind> TensorGpu<T, K> {
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
     pub async fn back(self) -> TensorCpu<T> {
         if self.is_empty() {
             return TensorCpu {
